@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: email-mcp
+  labels:
+    app: email-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-mcp
+  template:
+    metadata:
+      labels:
+        app: email-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: email-mcp
+          image: ghcr.io/davidwuest/email-mcp:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: ACCOUNTS_FILE
+              value: /etc/email-mcp/accounts.json
+            - name: MCP_TRANSPORT
+              value: streamable-http
+            - name: MCP_HOST
+              value: "0.0.0.0"
+            - name: MCP_PORT
+              value: "8000"
+          volumeMounts:
+            - name: accounts-config
+              mountPath: /etc/email-mcp
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: accounts-config
+          secret:
+            secretName: email-mcp-accounts
+            items:
+              - key: accounts.json
+                path: accounts.json
