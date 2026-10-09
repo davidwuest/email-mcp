@@ -1,6 +1,10 @@
 # email-mcp
 
-MCP server exposing email tools (via [simple-email-mcp](https://pypi.org/project/simple-email-mcp/)) over streamable HTTP, packaged for Kubernetes.
+MCP server exposing email tools over streamable HTTP, packaged for Kubernetes.
+
+## Origin
+
+[simple_email_mcp.py](simple_email_mcp.py) is vendored from [simple-email-mcp](https://github.com/mexican75/simple-email-mcp) 2.2.0 by Ramon Ramirez (MIT, see [LICENSE-simple-email-mcp](LICENSE-simple-email-mcp)) and developed further in this repo. It is no longer installed from PyPI, so upstream releases are not picked up automatically.
 
 ## Image
 
