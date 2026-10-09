@@ -1,6 +1,6 @@
 # email-mcp
 
-MCP server exposing email tools over streamable HTTP, packaged for Kubernetes.
+MCP server exposing email tools over streamable HTTP, packaged as a Docker image.
 
 ## Origin
 
@@ -16,22 +16,39 @@ ghcr.io/davidwuest/email-mcp:latest
 
 ## Configuration
 
-The server reads account credentials from the file at `ACCOUNTS_FILE` (default `/etc/email-mcp/accounts.json`). See [k8s/secret.yaml.sample](k8s/secret.yaml.sample) for the expected format.
+The server reads mail accounts from the JSON file at `ACCOUNTS_FILE`:
 
-| Env var         | Default                          | Description                  |
-|-----------------|-----------------------------------|-------------------------------|
-| `ACCOUNTS_FILE` | `/etc/email-mcp/accounts.json`   | Path to accounts config       |
-| `MCP_TRANSPORT` | `streamable-http`                | MCP transport mode            |
-| `MCP_HOST`      | `0.0.0.0`                         | Bind host                     |
-| `MCP_PORT`      | `8000`                            | Bind port                     |
+```json
+{
+  "send_code": "optional code required to send mail",
+  "accounts": [
+    {
+      "name": "personal",
+      "address": "me@example.com",
+      "password": "your-app-password",
+      "provider": "gmail"
+    }
+  ]
+}
+```
 
-## Deploying to Kubernetes
+`provider` fills in IMAP/SMTP hosts for `gmail`, `outlook`, `purelymail` and `domainfactory`; for any other server set `imap_host`, `imap_port`, `smtp_host`, `smtp_port` and `smtp_security` (`ssl` or `starttls`) instead. Optional per account: `send_as`, `display_name`, `description`.
 
-1. Copy `k8s/secret.yaml.sample` to `k8s/secret.yaml`, fill in your real account credentials under `stringData`, and apply it (it's gitignored so it won't be committed).
-2. Apply the rest of the manifests:
+| Env var             | Default                                      | Description                                                        |
+|---------------------|----------------------------------------------|--------------------------------------------------------------------|
+| `ACCOUNTS_FILE`     | `accounts.json` next to `simple_email_mcp.py` | Path to the accounts config                                        |
+| `MCP_TRANSPORT`     | `streamable-http`                            | MCP transport mode                                                 |
+| `MCP_HOST`          | `0.0.0.0`                                    | Bind host                                                          |
+| `MCP_PORT`          | `8000`                                       | Bind port                                                          |
+| `MCP_ALLOWED_HOSTS` | (unset: only `localhost` / `127.0.0.1`)      | Comma-separated hostnames accepted in the `Host` header (`host:*` allows any port); replaces the localhost default |
+
+In the container, mount the file and point `ACCOUNTS_FILE` at it:
 
 ```sh
-kubectl apply -f k8s/secret.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
+docker run -p 8000:8000 \
+  -v ./accounts.json:/etc/email-mcp/accounts.json:ro \
+  -e ACCOUNTS_FILE=/etc/email-mcp/accounts.json \
+  ghcr.io/davidwuest/email-mcp:latest
 ```
+
+The server has no authentication of its own yet: when exposing it beyond localhost, put it behind something that authenticates requests.
