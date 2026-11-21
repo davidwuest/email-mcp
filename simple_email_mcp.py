@@ -852,6 +852,7 @@ def _folder_param(description: str = "folder name as shown by list_folders ('nam
     return Param("folder", description, default="INBOX")
 
 _UID = Param("uid", "UID of the email", required=True)
+_UID_LIST = Param("uid_list", "UID of the email, or a list of UIDs (up to 500, also accepted as '101, 102')", required=True, max=500)
 _BODY_HTML = Param("str", "HTML body", blank_is_absent=True)
 _ATTACHMENTS = Param("str", _ATTACHMENT_PATHS, blank_is_absent=True)
 _ATTACHMENTS_INLINE = Param("json_array", "JSON array " + _INLINE_JSON, blank_is_absent=True)
@@ -898,11 +899,11 @@ ACTION_SCHEMAS: Dict[str, ActionSchema] = {
         "folder": _folder_param(), "body": Param("str", "text added above the forwarded message"),
         "body_html": _BODY_HTML, "include_attachments": Param("bool", "forward the original attachments", default=True),
         "attachments": _ATTACHMENTS, "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
-    "move": ActionSchema("Move email to another folder.", {
-        "uid": _UID, "destination_folder": Param("folder", "target folder", required=True), "account": _account_param(),
+    "move": ActionSchema("Move one or more emails to another folder.", {
+        "uid": _UID_LIST, "destination_folder": Param("folder", "target folder", required=True), "account": _account_param(),
         "source_folder": _folder_param("folder the email is in")}),
-    "mark": ActionSchema("Mark email read/unread/flag/unflag.", {
-        "uid": _UID, "action": Param("choice", "what to set", required=True, choices=("read", "unread", "flag", "unflag")),
+    "mark": ActionSchema("Mark one or more emails read/unread/flag/unflag.", {
+        "uid": _UID_LIST, "action": Param("choice", "what to set", required=True, choices=("read", "unread", "flag", "unflag")),
         "account": _account_param(), "folder": _folder_param()}),
     "save_attachment": ActionSchema("Save attachment to disk.", {
         "uid": _UID, "attachment_index": Param("int", "index from read", required=True, min=0),
@@ -969,6 +970,20 @@ def _coerce_int(value: Any, param: Param) -> int:
 def _coerce_uid(value: Any, param: Param) -> int:
     return _range_check(_to_int(value, param), 1, _MAX_UID)
 
+def _coerce_uid_list(value: Any, param: Param) -> list:
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    if not items:
+        raise _Invalid("invalid_value", hint="at least one UID is required")
+    uids = list(dict.fromkeys(_coerce_uid(item.strip() if isinstance(item, str) else item, param) for item in items))
+    if param.max is not None and len(uids) > param.max:
+        raise _Invalid("too_many", max=param.max, got=len(uids))
+    return uids
+
 def _coerce_bool(value: Any, param: Param) -> bool:
     if isinstance(value, bool):
         return value
@@ -1016,7 +1031,7 @@ def _coerce_choice(value: Any, param: Param) -> str:
 
 _COERCERS: Dict[str, Callable[[Any, Param], Any]] = {
     "str": _coerce_str, "int": _coerce_int, "bool": _coerce_bool, "strict_bool": _coerce_strict_bool,
-    "uid": _coerce_uid, "folder": _coerce_folder, "addresses": _coerce_addresses,
+    "uid": _coerce_uid, "uid_list": _coerce_uid_list, "folder": _coerce_folder, "addresses": _coerce_addresses,
     "json_array": _coerce_json_array, "choice": _coerce_choice,
 }
 
@@ -1075,7 +1090,7 @@ def _validate_params(action: str, params: Dict[str, Any]) -> tuple[Dict[str, Any
             problems.extend(rule(values))
     return values, problems
 
-_KIND_LABELS = {"str": "str", "int": "int", "bool": "bool", "strict_bool": "bool", "uid": "int",
+_KIND_LABELS = {"str": "str", "int": "int", "bool": "bool", "strict_bool": "bool", "uid": "int", "uid_list": "int or list of int",
                 "folder": "str", "addresses": "str (comma-separated addresses)", "json_array": "str (JSON array)"}
 
 def _describe_param(param: Param) -> str:
@@ -1083,7 +1098,9 @@ def _describe_param(param: Param) -> str:
     parts = [label, "required" if param.required else "optional"]
     if param.default is not None:
         parts.append(f"default={str(param.default).lower() if isinstance(param.default, bool) else param.default}")
-    if param.min is not None or param.max is not None:
+    if param.kind == "uid_list":
+        parts.append(f"max {param.max} per call")
+    elif param.min is not None or param.max is not None:
         parts.append(f"{'' if param.min is None else param.min}-{'' if param.max is None else param.max}")
     return f"{param.description} ({', '.join(parts)})"
 
@@ -1107,6 +1124,8 @@ def _problem_text(action: str, problem: dict) -> str:
         return text + (f"; {problem['hint']}" if problem.get("hint") else "")
     if kind == "out_of_range":
         return f"'{name}' is out of range ({problem.get('min', '')}-{problem.get('max', '')})"
+    if kind == "too_many":
+        return f"'{name}' has {problem['got']} entries, max is {problem['max']}"
     if kind == "invalid_value":
         text = f"'{name}' has an invalid value"
         if problem.get("allowed"):
@@ -1419,7 +1438,51 @@ async def _do_forward(p: Dict[str, Any]) -> str:
     except Exception as e:
         return f"Error forwarding: {e}"
 
-async def _do_move(account: Optional[str], uid: str, source_folder: str, destination_folder: str) -> str:
+def _uid_set(uids: list) -> str:
+    return ",".join(str(uid) for uid in uids)
+
+def _server_text(data: Any) -> str:
+    parts = []
+    for item in data or []:
+        if isinstance(item, bytes):
+            parts.append(item.decode("utf-8", errors="replace"))
+        elif isinstance(item, str):
+            parts.append(item)
+    return " ".join(parts).strip()[:200]
+
+def _uid_command(conn: imaplib.IMAP4_SSL, *args: str) -> tuple[str, list]:
+    # imaplib raises for BAD but returns NO; treat both alike.
+    try:
+        return conn.uid(*args)
+    except imaplib.IMAP4.error as e:
+        return "BAD", [str(e).encode("utf-8", errors="replace")]
+
+def _existing_uids(conn: imaplib.IMAP4_SSL, uids: list) -> tuple[list, list]:
+    status, data = conn.uid("SEARCH", None, "UID", _uid_set(uids))
+    if status != "OK":
+        raise RuntimeError("Could not look up the UIDs in the folder.")
+    present = {int(u) for u in (data[0].split() if data and data[0] else [])}
+    return [u for u in uids if u in present], [u for u in uids if u not in present]
+
+def _still_in_folder(conn: imaplib.IMAP4_SSL, uids: list) -> Optional[set]:
+    """UIDs still present after a failed command, or None if even that cannot be established."""
+    try:
+        return set(_existing_uids(conn, uids)[0])
+    except Exception:
+        return None
+
+def _bulk_result(base: dict, requested: int, done_key: str, done: list, not_found: list, failed: list,
+                 duplicated: Optional[list] = None, error: Optional[str] = None) -> str:
+    status = "ok" if len(done) == requested else ("failed" if not done else "partial")
+    result = {"status": status, **base, "requested": requested, done_key: [str(u) for u in done],
+              "not_found": [str(u) for u in not_found], "failed": [str(u) for u in failed]}
+    if duplicated is not None:
+        result["duplicated"] = [str(u) for u in duplicated]
+    if error and (failed or duplicated):
+        result["error"] = error
+    return json.dumps(result, indent=2)
+
+async def _do_move(account: Optional[str], uids: list, source_folder: str, destination_folder: str) -> str:
     try:
         acct = _resolve_account(account)
         with _imap_session(acct) as conn:
@@ -1432,41 +1495,95 @@ async def _do_move(account: Optional[str], uid: str, source_folder: str, destina
             method = _move_method(_imap_capabilities(conn))
             if method is None:
                 return "Error: server supports neither MOVE nor UIDPLUS; refusing to move because a plain EXPUNGE could delete other messages."
-            if method == "move":
-                status, _ = conn.uid("move", uid, quoted_destination)
-                if status != "OK":
-                    return f"Error: Could not move email to '{dst['name']}'."
-            else:
-                status, _ = conn.uid("copy", uid, quoted_destination)
-                if status != "OK":
-                    return f"Error: Could not copy email to '{dst['name']}'."
-                status, _ = conn.uid("store", uid, "+FLAGS.SILENT", "(\\Deleted)")
-                if status != "OK":
-                    return f"Error: Email was copied to '{dst['name']}' but could not be marked for removal from '{src['name']}'; it now exists in both folders."
-                status, _ = conn.uid("expunge", uid)
-                if status != "OK":
-                    return f"Error: Email was copied to '{dst['name']}' but could not be removed from '{src['name']}'; it remains there flagged \\Deleted."
-            return json.dumps({"status": "moved", "account": acct["address"], "uid": uid, "from_folder": src["name"], "to_folder": dst["name"]}, indent=2)
+            found, not_found = _existing_uids(conn, uids)
+            base = {"account": acct["address"], "source_folder": src["name"], "destination_folder": dst["name"], "method": method}
+            moved, failed, duplicated, error = [], [], [], None
+            if found:
+                uid_set = _uid_set(found)
+                if method == "move":
+                    status, data = _uid_command(conn, "MOVE", uid_set, quoted_destination)
+                    if status == "OK":
+                        moved = found
+                    else:
+                        error = _server_text(data) or "MOVE failed"
+                        left = _still_in_folder(conn, found)
+                        if left is None:
+                            error += "; could not verify which emails were moved"
+                            left = set(found)
+                        failed = [u for u in found if u in left]
+                        moved = [u for u in found if u not in left]
+                else:
+                    status, data = _uid_command(conn, "COPY", uid_set, quoted_destination)
+                    if status != "OK":
+                        error = _server_text(data) or "COPY failed"
+                        failed = found
+                    else:
+                        fetched, snapshot = _uid_command(conn, "FETCH", uid_set, "(FLAGS)")
+                        flags_before = _flags_by_uid(snapshot) if fetched == "OK" else {}
+                        already_deleted = {u for u, flags in flags_before.items() if "\\Deleted" in flags} | (set(found) - set(flags_before))
+                        status, data = _uid_command(conn, "STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                        if status == "OK":
+                            status, data = _uid_command(conn, "EXPUNGE", uid_set)
+                        if status == "OK":
+                            moved = found
+                        else:
+                            error = _server_text(data) or "removing the originals failed"
+                            left = _still_in_folder(conn, found)
+                            if left is None:
+                                error += "; could not verify which emails were moved"
+                                left = set(found)
+                            duplicated = [u for u in found if u in left]
+                            moved = [u for u in found if u not in left]
+                            to_clear = [u for u in duplicated if u not in already_deleted]
+                            if to_clear:
+                                status, _ = _uid_command(conn, "STORE", _uid_set(to_clear), "-FLAGS.SILENT", "(\\Deleted)")
+                                if status != "OK":
+                                    error += "; could not remove the \\Deleted flag again"
+            return _bulk_result(base, len(uids), "moved", moved, not_found, failed, duplicated, error)
     except FolderError as e:
         return e.to_json()
     except Exception as e:
-        return f"Error moving email: {e}"
+        return f"Error moving emails: {e}"
 
-async def _do_mark(account: Optional[str], uid: str, folder: str, action: str) -> str:
+_FLAG_CHANGES = {"read": ("+", "\\Seen"), "unread": ("-", "\\Seen"), "flag": ("+", "\\Flagged"), "unflag": ("-", "\\Flagged")}
+
+def _flags_by_uid(data: list) -> Dict[int, set]:
+    states: Dict[int, set] = {}
+    for item in data or []:
+        text = (item[0] if isinstance(item, tuple) else item)
+        if not isinstance(text, bytes):
+            continue
+        line = text.decode("utf-8", errors="replace")
+        uid_match, flags_match = re.search(r"UID (\d+)", line), re.search(r"FLAGS \(([^)]*)\)", line)
+        if uid_match and flags_match:
+            states[int(uid_match.group(1))] = set(flags_match.group(1).split())
+    return states
+
+async def _do_mark(account: Optional[str], uids: list, folder: str, action: str) -> str:
     try:
         acct = _resolve_account(account)
         with _imap_session(acct) as conn:
-            _open_folder(conn, folder, readonly=False)
-            flag_map = {"read": ("+FLAGS", "(\\Seen)"), "unread": ("-FLAGS", "(\\Seen)"), "flag": ("+FLAGS", "(\\Flagged)"), "unflag": ("-FLAGS", "(\\Flagged)")}
-            op, flag = flag_map[action]
-            status, _ = conn.uid("store", uid, op, flag)
-            if status != "OK":
-                return f"Error: Could not mark email as '{action}'."
-            return json.dumps({"status": "success", "account": acct["address"], "uid": uid, "action": action}, indent=2)
+            opened = _open_folder(conn, folder, readonly=False)
+            found, not_found = _existing_uids(conn, uids)
+            base = {"account": acct["address"], "folder": opened["name"], "mark": action}
+            marked, failed, error = [], [], None
+            if found:
+                sign, flag = _FLAG_CHANGES[action]
+                uid_set = _uid_set(found)
+                status, data = _uid_command(conn, "STORE", uid_set, f"{sign}FLAGS.SILENT", f"({flag})")
+                if status == "OK":
+                    marked = found
+                else:
+                    error = _server_text(data) or "STORE failed"
+                    status, data = _uid_command(conn, "FETCH", uid_set, "(FLAGS)")
+                    states = _flags_by_uid(data) if status == "OK" else {}
+                    marked = [u for u in found if u in states and ((flag.lower() in {f.lower() for f in states[u]}) == (sign == "+"))]
+                    failed = [u for u in found if u not in marked]
+            return _bulk_result(base, len(uids), "marked", marked, not_found, failed, None, error)
     except FolderError as e:
         return e.to_json()
     except Exception as e:
-        return f"Error marking email: {e}"
+        return f"Error marking emails: {e}"
 
 async def _do_save_attachment(account: Optional[str], uid: str, folder: str, attachment_index: int, save_path: str, overwrite: bool) -> str:
     try:
@@ -1567,9 +1684,9 @@ async def email_dispatcher(action: str, params: Optional[Dict[str, Any]] = None)
     elif action == "forward":
         return await _do_forward(p)
     elif action == "move":
-        return await _do_move(p.get("account"), str(p["uid"]), p["source_folder"], p["destination_folder"])
+        return await _do_move(p.get("account"), p["uid"], p["source_folder"], p["destination_folder"])
     elif action == "mark":
-        return await _do_mark(p.get("account"), str(p["uid"]), p["folder"], p["action"])
+        return await _do_mark(p.get("account"), p["uid"], p["folder"], p["action"])
     elif action == "save_attachment":
         return await _do_save_attachment(p.get("account"), str(p["uid"]), p["folder"], p["attachment_index"], p["save_path"], p["overwrite"])
     elif action == "get_attachment":
