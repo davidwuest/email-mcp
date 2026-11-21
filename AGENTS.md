@@ -20,11 +20,14 @@ Python 3.12, MCP server built on FastMCP from the `mcp` SDK (pinned in `requirem
 This project is spec-driven: every non-trivial feature goes through `intent.md` → `spec.md` → `plan.md` in `.agent/specs/<feature-name>/` before any code is written. Follow the `feature-workflow` skill (installed from AGENT-GOVERNANCE into `~/.claude/skills/feature-workflow/`); it holds the steps and the templates. If the skill isn't installed, ask before writing any code for a feature.
 
 ## Setup
-- Install dependencies with `python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
+- Install dependencies with `uv venv --python 3.12 .venv && uv pip install --python .venv -r requirements-dev.txt` (or `python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`).
 - Start the server locally with `MCP_HOST=127.0.0.1 ACCOUNTS_FILE=<path to accounts.json> .venv/bin/python entrypoint.py` (listens on `:8000`, MCP endpoint `/mcp`), or build the image with `docker build -t email-mcp .`.
 
 ## Tests
-No automated test suite yet. Until there is one, build the image and smoke-test it against a dummy `accounts.json` before committing: MCP `tools/call` of the single tool `email` with arguments `{"action": "validate_config", "params": {}}`. Leaving out `params` returns the action's schema instead of running it.
+- Tests must run on Python 3.12 (like the image): `imaplib` differs in quoting and capability handling in newer versions, and `tests/conftest.py` refuses to run elsewhere.
+- Unit tests, no network: `.venv/bin/python -m pytest -q`.
+- Integration tests, need Docker (throwaway Dovecot 2.4.4 and 2.3.21.1 plus a local SMTP sink): `.venv/bin/python -m pytest -q -m integration`. They only talk to those local servers, never to a real mailbox.
+- Before committing a change to the image, also build it and smoke-test it against a dummy `accounts.json`: MCP `tools/call` of the single tool `email` with arguments `{"action": "validate_config", "params": {}}`. Leaving out `params` returns the action's schema instead of running it.
 
 ## Conventions
 - Code, comments and commit messages in English; specs in `.agent/specs/` may be in German.
