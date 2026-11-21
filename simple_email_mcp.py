@@ -652,6 +652,38 @@ def _parse_address_list(*fields: Optional[str]) -> list[str]:
             addresses.append(addr.strip())
     return addresses
 
+def _own_addresses(acct: Dict[str, Any]) -> set:
+    return {acct["address"].lower(), _sender_address(acct).lower()}
+
+def _format_address_header(pairs: list) -> str:
+    return ", ".join(formataddr(pair) for pair in pairs)
+
+def _merge_reply_recipients(to_addr: str, auto_cc: list, cc: list, bcc: list, own: set) -> tuple[list, list, list]:
+    """Combine automatic and caller-supplied reply recipients; each address is mailed once (To > Cc > Bcc)."""
+    taken = {to_addr.lower()}
+    dropped: list = []
+    merged_cc: list = []
+    merged_bcc: list = []
+    for name, addr in auto_cc:
+        if addr.lower() in own or addr.lower() in taken:
+            continue
+        taken.add(addr.lower())
+        merged_cc.append((name, addr))
+    for pairs, field, target in ((cc, "cc", merged_cc), (bcc, "bcc", merged_bcc)):
+        for name, addr in pairs:
+            key = addr.lower()
+            if key in own:
+                dropped.append({"address": addr, "field": field, "reason": "own_address"})
+            elif key in taken:
+                dropped.append({"address": addr, "field": field, "reason": "duplicate"})
+            else:
+                taken.add(key)
+                target.append((name, addr))
+    return merged_cc, merged_bcc, dropped
+
+def _caller_pairs(p: Dict[str, Any], name: str) -> list:
+    return list(p[name].pairs) if p.get(name) else []
+
 def _reply_address(msg: Message) -> Optional[str]:
     """Resolve Reply-To/From to one safe SMTP mailbox address."""
     candidates = _parse_address_list(
@@ -704,6 +736,7 @@ def _compose_and_send(
     in_reply_to: Optional[str] = None, references: Optional[str] = None,
     file_attachments: Optional[str] = None, inline_attachments: Optional[str] = None,
     calendar_ics: Optional[str] = None, forwarded_parts: Optional[list] = None,
+    reply_to: Optional[str] = None,
 ) -> dict:
     has_attachments = bool(file_attachments and file_attachments.strip()) or bool(inline_attachments) or bool(forwarded_parts)
     # Build body part
@@ -732,6 +765,7 @@ def _compose_and_send(
     mime["Date"] = formatdate(localtime=True)
     mime["Message-ID"] = make_msgid(domain=sender.split("@", 1)[1])
     if cc: mime["Cc"] = cc
+    if reply_to: mime["Reply-To"] = reply_to
     if in_reply_to: mime["In-Reply-To"] = in_reply_to
     if references: mime["References"] = references
     if file_attachments:
@@ -779,6 +813,7 @@ def _compose_and_send(
     result = {"status": "sent", "from": sender, "to": to, "subject": subject}
     if cc: result["cc"] = cc
     if bcc: result["bcc"] = bcc
+    if reply_to: result["reply_to"] = reply_to
     if sent_warning: result["warning"] = sent_warning
     return result
 
@@ -820,6 +855,9 @@ _UID = Param("uid", "UID of the email", required=True)
 _BODY_HTML = Param("str", "HTML body", blank_is_absent=True)
 _ATTACHMENTS = Param("str", _ATTACHMENT_PATHS, blank_is_absent=True)
 _ATTACHMENTS_INLINE = Param("json_array", "JSON array " + _INLINE_JSON, blank_is_absent=True)
+_REPLY_TO = Param("addresses", "Reply-To header address(es): where answers to this mail should go", blank_is_absent=True)
+_CC = Param("addresses", "Cc address(es)", blank_is_absent=True)
+_BCC = Param("addresses", "Bcc address(es)", blank_is_absent=True)
 _CONFIRMATION = Param("str", "required if a send_code is configured", single_line=True, type_hint="pass the code as a string")
 
 ACTION_SCHEMAS: Dict[str, ActionSchema] = {
@@ -838,22 +876,23 @@ ACTION_SCHEMAS: Dict[str, ActionSchema] = {
         "subject": Param("str", "subject line", required=True, single_line=True),
         "body": Param("str", "plain text body", required=True),
         "account": _account_param(),
-        "cc": Param("addresses", "Cc address(es)", blank_is_absent=True),
-        "bcc": Param("addresses", "Bcc address(es)", blank_is_absent=True),
+        "cc": _CC, "bcc": _BCC, "reply_to": _REPLY_TO,
         "body_html": _BODY_HTML, "attachments": _ATTACHMENTS, "attachments_inline": _ATTACHMENTS_INLINE,
         "calendar_ics": Param("str", "iCalendar text to attach as an invite", blank_is_absent=True),
         "confirmation_code": _CONFIRMATION,
-        "reply_to_uid": Param("uid", "thread this mail as a reply to the message with this UID (sets In-Reply-To/References)"),
+        "reply_to_uid": Param("uid", "thread this mail as a reply to the message with this UID (sets In-Reply-To/References); not the Reply-To header, see reply_to"),
         "reply_to_folder": _folder_param("folder holding reply_to_uid"),
     }),
     "reply": ActionSchema("Reply to an email.", {
         "uid": _UID, "body": Param("str", "plain text reply", required=True), "account": _account_param(),
         "folder": _folder_param(), "body_html": _BODY_HTML, "attachments": _ATTACHMENTS,
-        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
+        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION,
+        "cc": _CC, "bcc": _BCC, "reply_to": _REPLY_TO}),
     "reply_all": ActionSchema("Reply to all recipients.", {
         "uid": _UID, "body": Param("str", "plain text reply", required=True), "account": _account_param(),
         "folder": _folder_param(), "body_html": _BODY_HTML, "attachments": _ATTACHMENTS,
-        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
+        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION,
+        "cc": _CC, "bcc": _BCC, "reply_to": _REPLY_TO}),
     "forward": ActionSchema("Forward an email.", {
         "uid": _UID, "to": Param("addresses", "recipient address(es)", required=True), "account": _account_param(),
         "folder": _folder_param(), "body": Param("str", "text added above the forwarded message"),
@@ -1026,7 +1065,11 @@ def _validate_params(action: str, params: Dict[str, Any]) -> tuple[Dict[str, Any
         try:
             values[name] = _COERCERS[param.kind](value, param)
         except _Invalid as invalid:
-            problems.append({"param": name, "problem": invalid.problem, **invalid.extra})
+            extra = dict(invalid.extra)
+            if (name == "reply_to" and invalid.problem == "invalid_address" and "reply_to_uid" in schema.params
+                    and isinstance(value, str) and value.strip().isdigit()):
+                extra["did_you_mean"] = ["reply_to_uid"]
+            problems.append({"param": name, "problem": invalid.problem, **extra})
     if not problems:
         for rule in schema.rules:
             problems.extend(rule(values))
@@ -1212,6 +1255,9 @@ async def _do_read(account: Optional[str], uid: str, folder: str) -> str:
     except Exception as e:
         return f"Error reading email: {e}"
 
+def _reply_to_header(p: Dict[str, Any]) -> Optional[str]:
+    return _format_address_header(p["reply_to"].pairs) if p.get("reply_to") else None
+
 def _raw_addresses(p: Dict[str, Any], name: str) -> Optional[str]:
     return p[name].raw if p.get(name) else None
 
@@ -1233,7 +1279,7 @@ async def _do_send(p: Dict[str, Any]) -> str:
                 if orig_id:
                     in_reply_to = orig_id
                     references = orig_id
-        result = _compose_and_send(acct, p["to"].raw, p["subject"], p["body"], body_html=p.get("body_html"), cc=_raw_addresses(p, "cc"), bcc=_raw_addresses(p, "bcc"), in_reply_to=in_reply_to, references=references, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), calendar_ics=p.get("calendar_ics"))
+        result = _compose_and_send(acct, p["to"].raw, p["subject"], p["body"], body_html=p.get("body_html"), cc=_raw_addresses(p, "cc"), bcc=_raw_addresses(p, "bcc"), in_reply_to=in_reply_to, references=references, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), calendar_ics=p.get("calendar_ics"), reply_to=_reply_to_header(p))
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
@@ -1272,7 +1318,10 @@ async def _do_reply(p: Dict[str, Any]) -> str:
         if p.get("body_html"):
             quoted_html = orig_body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
             full_body_html = f"{p['body_html']}<br><br><div style='border-left:2px solid #ccc;padding-left:10px;color:#555;'>On {orig_date}, {orig_from} wrote:<br>{quoted_html}</div>"
-        result = _compose_and_send(acct, reply_addr, subject, full_body, body_html=full_body_html, in_reply_to=orig_msg_id, references=orig_msg_id, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"))
+        cc_pairs, bcc_pairs, dropped = _merge_reply_recipients(reply_addr, [], _caller_pairs(p, "cc"), _caller_pairs(p, "bcc"), _own_addresses(acct))
+        result = _compose_and_send(acct, reply_addr, subject, full_body, body_html=full_body_html, cc=_format_address_header(cc_pairs) or None, bcc=", ".join(addr for _, addr in bcc_pairs) or None, in_reply_to=orig_msg_id, references=orig_msg_id, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), reply_to=_reply_to_header(p))
+        if dropped and "error" not in result:
+            result["dropped"] = dropped
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
@@ -1307,22 +1356,17 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
         reply_addr = _reply_address(orig)
         if not reply_addr:
             return "Error: Original email has no valid Reply-To or From address."
-        my_addrs = {acct["address"].lower(), _sender_address(acct).lower()}
-        cc_addrs = []
-        seen_cc: set = set()
-        for addr in _parse_address_list(orig_to, orig_cc_h):
-            normalized = addr.lower()
-            if normalized in my_addrs or normalized == reply_addr.lower() or normalized in seen_cc:
-                continue
-            seen_cc.add(normalized)
-            cc_addrs.append(addr)
+        auto_cc = [("", addr) for addr in _parse_address_list(orig_to, orig_cc_h)]
         subject = orig_subject if re.match(r'(?i)^Re:\s', orig_subject) else f"Re: {orig_subject}"
         full_body = f"{p['body']}\n\n{_quote_body(orig_body, orig_from, orig_date)}"
         full_body_html = None
         if p.get("body_html"):
             quoted_html = orig_body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
             full_body_html = f"{p['body_html']}<br><br><div style='border-left:2px solid #ccc;padding-left:10px;color:#555;'>On {orig_date}, {orig_from} wrote:<br>{quoted_html}</div>"
-        result = _compose_and_send(acct, reply_addr, subject, full_body, body_html=full_body_html, cc=", ".join(cc_addrs) if cc_addrs else None, in_reply_to=orig_msg_id, references=orig_msg_id, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"))
+        cc_pairs, bcc_pairs, dropped = _merge_reply_recipients(reply_addr, auto_cc, _caller_pairs(p, "cc"), _caller_pairs(p, "bcc"), _own_addresses(acct))
+        result = _compose_and_send(acct, reply_addr, subject, full_body, body_html=full_body_html, cc=_format_address_header(cc_pairs) or None, bcc=", ".join(addr for _, addr in bcc_pairs) or None, in_reply_to=orig_msg_id, references=orig_msg_id, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), reply_to=_reply_to_header(p))
+        if dropped and "error" not in result:
+            result["dropped"] = dropped
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
