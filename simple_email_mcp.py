@@ -20,7 +20,7 @@ Configuration via accounts.json:
 }
 """
 
-import os, json, email, imaplib, smtplib, ssl, re, time, base64, mimetypes
+import os, json, email, imaplib, smtplib, ssl, re, time, base64, mimetypes, unicodedata, difflib
 from contextlib import contextmanager
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -324,18 +324,11 @@ def _move_method(capabilities: frozenset) -> Optional[str]:
     return None
 
 @contextmanager
-def _imap_session(acct: Dict[str, Any], folder: Optional[str] = None, readonly: bool = True):
+def _imap_session(acct: Dict[str, Any]):
     last_err = None
     for attempt in range(3):
         try:
             conn = _imap_connect(acct)
-            if folder:
-                status, data = conn.select(folder, readonly=readonly)
-                if status != "OK":
-                    detail = ""
-                    if data and data[0]:
-                        detail = data[0].decode("utf-8", errors="replace") if isinstance(data[0], bytes) else str(data[0])
-                    raise RuntimeError(f"Could not select folder '{folder}'" + (f": {detail}" if detail else ""))
             break
         except Exception as e:
             last_err = e
@@ -372,24 +365,154 @@ def _decode_imap_utf7(s: str) -> str:
             i += 1
     return ''.join(result)
 
-_IMAP_LIST_RE = re.compile(r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]+)"\s+(?P<name>.+)')
+class FolderError(Exception):
+    def __init__(self, payload: dict):
+        super().__init__(payload["error"])
+        self.payload = payload
+
+    def to_json(self) -> str:
+        return json.dumps(self.payload, indent=2, ensure_ascii=False)
+
+_NOT_SELECTABLE = ("\\noselect", "\\nonexistent")
+
+def _read_quoted(text: str) -> tuple[str, str]:
+    out = []
+    i = 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            out.append(text[i + 1])
+            i += 2
+        elif ch == '"':
+            return "".join(out), text[i + 1:]
+        else:
+            out.append(ch)
+            i += 1
+    raise ValueError("unterminated quoted string")
+
+def _parse_list_line(head: bytes, literal: Optional[bytes]) -> Optional[dict]:
+    text = head.decode("utf-8", errors="replace")
+    m = re.match(r"\s*\(([^)]*)\)\s+", text)
+    if not m:
+        return None
+    flags = tuple(m.group(1).split())
+    rest = text[m.end():]
+    if rest.startswith('"'):
+        delimiter, rest = _read_quoted(rest)
+    elif rest[:3].upper() == "NIL" and (len(rest) == 3 or rest[3] == " "):
+        delimiter, rest = None, rest[3:]
+    else:
+        return None
+    rest = rest.lstrip()
+    if literal is not None:
+        name = literal.decode("utf-8", errors="replace")
+    elif rest.startswith('"'):
+        name, _ = _read_quoted(rest)
+    else:
+        name = rest.split(" ", 1)[0]
+    if not name:
+        return None
+    if not name.isascii():
+        return None  # only possible with UTF8=ACCEPT, which is never enabled; don't let one odd entry break the rest
+    return {"name": unicodedata.normalize("NFC", _decode_imap_utf7(name)), "raw_name": name, "delimiter": delimiter, "flags": flags}
 
 def _parse_imap_list_response(raw_list: list) -> list[dict]:
-    folders = []
+    # imaplib hands out a literal as a tuple and the rest of that line as a separate element,
+    # and it also collects unsolicited LIST responses from earlier commands, hence the dedup.
+    folders: Dict[str, dict] = {}
+    after_literal = False
     for item in raw_list:
-        if not isinstance(item, bytes):
-            continue
-        line = item.decode("utf-8", errors="replace")
-        m = _IMAP_LIST_RE.match(line)
-        if m:
-            raw_name = m.group("name").strip().strip('"')
-            folders.append({"name": _decode_imap_utf7(raw_name), "raw_name": raw_name, "delimiter": m.group("delim"), "flags": m.group("flags")})
+        if isinstance(item, tuple):
+            parsed = _parse_list_line(item[0], item[1])
+            after_literal = True
+        elif isinstance(item, bytes):
+            if after_literal:
+                after_literal = False
+                if not item.strip() or item[:1] == b" ":
+                    continue
+            parsed = _parse_list_line(item, None)
         else:
-            parts = line.rsplit(None, 1)
-            if parts:
-                raw_name = parts[-1].strip('"')
-                folders.append({"name": _decode_imap_utf7(raw_name), "raw_name": raw_name, "delimiter": ".", "flags": ""})
-    return folders
+            continue
+        if parsed:
+            folders[parsed["raw_name"]] = parsed
+    return list(folders.values())
+
+def _has_flag(folder: dict, flag: str) -> bool:
+    return flag.lower() in (f.lower() for f in folder["flags"])
+
+def _quote_mailbox(raw_name: str) -> str:
+    try:
+        raw_name.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("Mailbox name must be the ASCII raw_name reported by the server.")
+    if any(ch in raw_name for ch in "\r\n\x00"):
+        raise ValueError("Mailbox name contains a control character.")
+    return '"' + raw_name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+def _folder_suggestions(folders: list[dict], value: str) -> list[str]:
+    folders = [f for f in folders if not any(_has_flag(f, flag) for flag in _NOT_SELECTABLE)]
+    key = unicodedata.normalize("NFC", value).casefold()
+    suggestions: list[str] = []
+    for f in folders:
+        last = f["name"].split(f["delimiter"])[-1] if f["delimiter"] else f["name"]
+        if last.casefold() == key and f["name"] not in suggestions:
+            suggestions.append(f["name"])
+    by_key = {f["name"].casefold(): f["name"] for f in folders}
+    for close in difflib.get_close_matches(key, list(by_key), n=3, cutoff=0.6):
+        if by_key[close] not in suggestions:
+            suggestions.append(by_key[close])
+    return suggestions[:3]
+
+def _match_folder(folders: list[dict], value: str, param: str) -> dict:
+    nfc = unicodedata.normalize("NFC", value)
+    matches = [f for f in folders if f["raw_name"] == value]
+    if not matches:
+        matches = [f for f in folders if f["name"] == nfc]
+    if len(matches) > 1:
+        candidates = [{"name": f["name"], "raw_name": f["raw_name"]} for f in matches]
+        raise FolderError({
+            "error": f"Folder name for '{param}' matches several folders; pass the raw_name of one of them.",
+            "param": param, "problem": "folder_ambiguous", "candidates": candidates})
+    if not matches:
+        suggestions = _folder_suggestions(folders, value)
+        hint = " Did you mean: " + ", ".join(f"'{n}'" for n in suggestions) + "?" if suggestions else " Use list_folders to see the available folders."
+        raise FolderError({"error": f"Unknown folder for '{param}'." + hint, "param": param,
+                           "problem": "folder_not_found", "did_you_mean": suggestions})
+    folder = matches[0]
+    if any(_has_flag(folder, flag) for flag in _NOT_SELECTABLE):
+        raise FolderError({"error": f"Folder '{folder['name']}' for '{param}' cannot hold messages.",
+                           "param": param, "problem": "folder_not_selectable"})
+    return folder
+
+def _resolve_folders(conn: imaplib.IMAP4_SSL, wanted: Dict[str, str]) -> Dict[str, dict]:
+    resolved: Dict[str, dict] = {}
+    pending: Dict[str, str] = {}
+    for param, value in wanted.items():
+        if value.upper() == "INBOX":
+            resolved[param] = {"name": "INBOX", "raw_name": "INBOX", "delimiter": None, "flags": ()}
+        else:
+            pending[param] = value
+    if pending:
+        status, data = conn.list()
+        if status != "OK":
+            raise RuntimeError("Could not retrieve folder list.")
+        folders = _parse_imap_list_response(data)
+        for param, value in pending.items():
+            resolved[param] = _match_folder(folders, value, param)
+    return {param: resolved[param] for param in wanted}
+
+def _select(conn: imaplib.IMAP4_SSL, folder: dict, readonly: bool) -> None:
+    status, data = conn.select(_quote_mailbox(folder["raw_name"]), readonly=readonly)
+    if status != "OK":
+        detail = ""
+        if data and data[0]:
+            detail = data[0].decode("utf-8", errors="replace") if isinstance(data[0], bytes) else str(data[0])
+        raise RuntimeError(f"Could not select folder '{folder['name']}'" + (f": {detail}" if detail else ""))
+
+def _open_folder(conn: imaplib.IMAP4_SSL, value: str, param: str = "folder", readonly: bool = True) -> dict:
+    folder = _resolve_folders(conn, {param: value})[param]
+    _select(conn, folder, readonly)
+    return folder
 
 def _decode_header_value(value: Optional[str]) -> str:
     if not value:
@@ -466,7 +589,7 @@ def _find_sent_folder(conn: imaplib.IMAP4_SSL, acct: Dict[str, Any]) -> str:
         if status == "OK" and folder_list:
             parsed = _parse_imap_list_response(folder_list)
             for f in parsed:
-                if "\\sent" in f["flags"].lower():
+                if _has_flag(f, "\\Sent"):
                     _sent_folder_cache[cache_key] = f["raw_name"]
                     return f["raw_name"]
             for f in parsed:
@@ -483,7 +606,7 @@ def _save_to_sent(acct: Dict[str, Any], mime_message: str) -> Optional[str]:
         with _imap_session(acct) as conn:
             sent_folder = _find_sent_folder(conn, acct)
             date_time = imaplib.Time2Internaldate(time.time())
-            status, response = conn.append(sent_folder, "\\Seen", date_time, mime_message.encode("utf-8"))
+            status, response = conn.append(_quote_mailbox(sent_folder), "\\Seen", date_time, mime_message.encode("utf-8"))
             if status != "OK":
                 return f"Email sent, but failed to save to Sent folder ({status})"
     except Exception as e:
@@ -711,25 +834,25 @@ async def _do_list_folders(account: Optional[str] = None) -> str:
             folder_info = []
             for f in parsed:
                 entry = {"name": f["name"], "raw_name": f["raw_name"]}
-                flags_lower = f["flags"].lower()
-                if "\\sent" in flags_lower: entry["type"] = "sent"
-                elif "\\trash" in flags_lower or "\\deleted" in flags_lower: entry["type"] = "trash"
-                elif "\\drafts" in flags_lower: entry["type"] = "drafts"
-                elif "\\junk" in flags_lower or "\\spam" in flags_lower: entry["type"] = "spam"
-                elif "\\archive" in flags_lower: entry["type"] = "archive"
+                if _has_flag(f, "\\Sent"): entry["type"] = "sent"
+                elif _has_flag(f, "\\Trash") or _has_flag(f, "\\Deleted"): entry["type"] = "trash"
+                elif _has_flag(f, "\\Drafts"): entry["type"] = "drafts"
+                elif _has_flag(f, "\\Junk") or _has_flag(f, "\\Spam"): entry["type"] = "spam"
+                elif _has_flag(f, "\\Archive"): entry["type"] = "archive"
                 elif f["raw_name"].upper() == "INBOX": entry["type"] = "inbox"
                 folder_info.append(entry)
-            return json.dumps({"account": acct["address"], "folders": folder_info, "count": len(folder_info), "hint": "Use 'raw_name' in folder parameters."}, indent=2)
+            return json.dumps({"account": acct["address"], "folders": folder_info, "count": len(folder_info), "hint": "Use 'name' or 'raw_name' in folder parameters."}, indent=2)
     except Exception as e:
         return f"Error listing folders: {e}"
 
 async def _do_list_emails(account: Optional[str], folder: str, limit: int) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            opened = _open_folder(conn, folder)
             status, data = conn.uid("search", None, "ALL")
             if status != "OK":
-                return f"Error: Could not search folder '{folder}'."
+                return f"Error: Could not search folder '{opened['name']}'."
             uids = data[0].split() if data[0] else []
             uids = uids[-limit:]
             uids.reverse()
@@ -741,14 +864,17 @@ async def _do_list_emails(account: Optional[str], folder: str, limit: int) -> st
                 raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
                 if isinstance(raw, bytes):
                     results.append(_msg_to_summary(email.message_from_bytes(raw), uid))
-            return json.dumps({"account": acct["address"], "folder": folder, "count": len(results), "emails": results}, indent=2)
+            return json.dumps({"account": acct["address"], "folder": opened["name"], "count": len(results), "emails": results}, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error listing emails: {e}"
 
 async def _do_search(account: Optional[str], query: str, folder: str, limit: int) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            opened = _open_folder(conn, folder)
             try:
                 status, data = conn.uid("search", None, query)
             except imaplib.IMAP4.error as e:
@@ -766,14 +892,17 @@ async def _do_search(account: Optional[str], query: str, folder: str, limit: int
                 raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
                 if isinstance(raw, bytes):
                     results.append(_msg_to_summary(email.message_from_bytes(raw), uid))
-            return json.dumps({"account": acct["address"], "query": query, "folder": folder, "count": len(results), "emails": results}, indent=2)
+            return json.dumps({"account": acct["address"], "query": query, "folder": opened["name"], "count": len(results), "emails": results}, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error searching emails: {e}"
 
 async def _do_read(account: Optional[str], uid: str, folder: str) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {uid}."
@@ -789,6 +918,8 @@ async def _do_read(account: Optional[str], uid: str, folder: str) -> str:
             except Exception:
                 date_formatted = date_str
             return json.dumps({"account": acct["address"], "uid": uid, "from": _decode_header_value(msg.get("From")), "to": _decode_header_value(msg.get("To")), "cc": _decode_header_value(msg.get("Cc")), "subject": _decode_header_value(msg.get("Subject")), "date": date_formatted, "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""), "body": body[:50000], "attachments": attachments}, indent=2, ensure_ascii=False)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error reading email: {e}"
 
@@ -800,21 +931,22 @@ async def _do_send(p: Dict[str, Any]) -> str:
         acct = _resolve_account(p.get("account"))
         in_reply_to = references = None
         if p.get("reply_to_uid"):
-            try:
-                with _imap_session(acct, folder=p.get("reply_to_folder", "INBOX")) as conn:
-                    status, msg_data = conn.uid("fetch", p["reply_to_uid"], "(RFC822.HEADER)")
-                    if status == "OK" and msg_data and msg_data[0]:
-                        raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
-                        if isinstance(raw, bytes):
-                            orig_id = email.message_from_bytes(raw).get("Message-ID", "")
-                            if orig_id:
-                                in_reply_to = orig_id
-                                references = orig_id
-            except Exception: pass
+            with _imap_session(acct) as conn:
+                opened = _open_folder(conn, p.get("reply_to_folder", "INBOX"), "reply_to_folder")
+                status, msg_data = conn.uid("fetch", p["reply_to_uid"], "(RFC822.HEADER)")
+                raw = msg_data[0][1] if status == "OK" and msg_data and isinstance(msg_data[0], tuple) else (msg_data[0] if status == "OK" and msg_data else None)
+                if not isinstance(raw, bytes):
+                    return f"Error: reply_to_uid {p['reply_to_uid']} not found in folder '{opened['name']}'; nothing was sent."
+                orig_id = email.message_from_bytes(raw).get("Message-ID", "")
+                if orig_id:
+                    in_reply_to = orig_id
+                    references = orig_id
         result = _compose_and_send(acct, p["to"], p["subject"], p["body"], body_html=p.get("body_html"), cc=p.get("cc"), bcc=p.get("bcc"), in_reply_to=in_reply_to, references=references, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), calendar_ics=p.get("calendar_ics"))
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error sending email: {e}"
 
@@ -825,7 +957,8 @@ async def _do_reply(p: Dict[str, Any]) -> str:
     try:
         acct = _resolve_account(p.get("account"))
         folder = p.get("folder", "INBOX")
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {p['uid']}."
@@ -851,6 +984,8 @@ async def _do_reply(p: Dict[str, Any]) -> str:
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error replying: {e}"
 
@@ -861,7 +996,8 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
     try:
         acct = _resolve_account(p.get("account"))
         folder = p.get("folder", "INBOX")
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {p['uid']}."
@@ -898,6 +1034,8 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error replying all: {e}"
 
@@ -908,7 +1046,8 @@ async def _do_forward(p: Dict[str, Any]) -> str:
     try:
         acct = _resolve_account(p.get("account"))
         folder = p.get("folder", "INBOX")
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {p['uid']}."
@@ -939,38 +1078,49 @@ async def _do_forward(p: Dict[str, Any]) -> str:
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error forwarding: {e}"
 
 async def _do_move(account: Optional[str], uid: str, source_folder: str, destination_folder: str) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=source_folder, readonly=False) as conn:
+        with _imap_session(acct) as conn:
+            resolved = _resolve_folders(conn, {"source_folder": source_folder, "destination_folder": destination_folder})
+            src, dst = resolved["source_folder"], resolved["destination_folder"]
+            if src["raw_name"] == dst["raw_name"]:
+                raise FolderError({"error": "Source and destination folder are the same.", "param": "destination_folder", "problem": "same_folder"})
+            _select(conn, src, readonly=False)
+            quoted_destination = _quote_mailbox(dst["raw_name"])
             method = _move_method(_imap_capabilities(conn))
             if method is None:
                 return "Error: server supports neither MOVE nor UIDPLUS; refusing to move because a plain EXPUNGE could delete other messages."
             if method == "move":
-                status, _ = conn.uid("move", uid, destination_folder)
+                status, _ = conn.uid("move", uid, quoted_destination)
                 if status != "OK":
-                    return f"Error: Could not move email to '{destination_folder}'."
+                    return f"Error: Could not move email to '{dst['name']}'."
             else:
-                status, _ = conn.uid("copy", uid, destination_folder)
+                status, _ = conn.uid("copy", uid, quoted_destination)
                 if status != "OK":
-                    return f"Error: Could not copy email to '{destination_folder}'."
+                    return f"Error: Could not copy email to '{dst['name']}'."
                 status, _ = conn.uid("store", uid, "+FLAGS.SILENT", "(\\Deleted)")
                 if status != "OK":
-                    return f"Error: Email was copied to '{destination_folder}' but could not be marked for removal from '{source_folder}'; it now exists in both folders."
+                    return f"Error: Email was copied to '{dst['name']}' but could not be marked for removal from '{src['name']}'; it now exists in both folders."
                 status, _ = conn.uid("expunge", uid)
                 if status != "OK":
-                    return f"Error: Email was copied to '{destination_folder}' but could not be removed from '{source_folder}'; it remains there flagged \\Deleted."
-            return json.dumps({"status": "moved", "account": acct["address"], "uid": uid, "from_folder": source_folder, "to_folder": destination_folder}, indent=2)
+                    return f"Error: Email was copied to '{dst['name']}' but could not be removed from '{src['name']}'; it remains there flagged \\Deleted."
+            return json.dumps({"status": "moved", "account": acct["address"], "uid": uid, "from_folder": src["name"], "to_folder": dst["name"]}, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error moving email: {e}"
 
 async def _do_mark(account: Optional[str], uid: str, folder: str, action: str) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder, readonly=False) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder, readonly=False)
             flag_map = {"read": ("+FLAGS", "(\\Seen)"), "unread": ("-FLAGS", "(\\Seen)"), "flag": ("+FLAGS", "(\\Flagged)"), "unflag": ("-FLAGS", "(\\Flagged)")}
             if action.lower() not in flag_map:
                 return f"Error: action must be one of: {', '.join(flag_map)}"
@@ -979,13 +1129,16 @@ async def _do_mark(account: Optional[str], uid: str, folder: str, action: str) -
             if status != "OK":
                 return f"Error: Could not mark email as '{action}'."
             return json.dumps({"status": "success", "account": acct["address"], "uid": uid, "action": action}, indent=2)
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error marking email: {e}"
 
 async def _do_save_attachment(account: Optional[str], uid: str, folder: str, attachment_index: int, save_path: str, overwrite: bool) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {uid}."
@@ -1009,13 +1162,16 @@ async def _do_save_attachment(account: Optional[str], uid: str, folder: str, att
                         f.write(payload)
                     return json.dumps({"saved": save_path, "filename": filename, "content_type": part.get_content_type(), "size_bytes": len(payload), "overwritten": existed_before}, indent=2)
             return f"Error: No part found at index {attachment_index}."
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error saving attachment: {e}"
 
 async def _do_get_attachment(account: Optional[str], uid: str, folder: str, attachment_index: int) -> str:
     try:
         acct = _resolve_account(account)
-        with _imap_session(acct, folder=folder) as conn:
+        with _imap_session(acct) as conn:
+            _open_folder(conn, folder)
             status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
                 return f"Error: Could not fetch email UID {uid}."
@@ -1031,6 +1187,8 @@ async def _do_get_attachment(account: Optional[str], uid: str, folder: str, atta
                     payload = part.get_payload(decode=True) or b""
                     return json.dumps({"filename": filename, "content_type": part.get_content_type(), "size_bytes": len(payload), "content_base64": base64.b64encode(payload).decode("ascii")}, indent=2)
             return f"Error: No part found at index {attachment_index}."
+    except FolderError as e:
+        return e.to_json()
     except Exception as e:
         return f"Error getting attachment: {e}"
 
