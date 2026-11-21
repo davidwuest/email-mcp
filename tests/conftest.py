@@ -69,3 +69,12 @@ def set_send_code(tmp_path, monkeypatch):
         monkeypatch.setenv("ACCOUNTS_FILE", str(write_accounts(tmp_path / "accounts.json", send_code=code)))
     return apply
 
+
+
+@pytest.fixture(autouse=True)
+def never_expunge_without_a_uid_set():
+    from fakes import FakeIMAP
+    FakeIMAP.instances.clear()
+    yield
+    for fake in FakeIMAP.instances:
+        assert fake.bare_expunges == 0, "EXPUNGE without a UID set would delete every \\Deleted message"

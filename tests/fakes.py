@@ -9,6 +9,7 @@ import imaplib
 import re
 from dataclasses import dataclass, field
 from email.message import EmailMessage
+from typing import Optional
 
 _ATOM_SPECIALS = re.compile(r'[\s(){%*"\\\]\x00-\x1f]')
 
@@ -35,6 +36,8 @@ class Failure:
     status: str = "NO"
     apply_first: int = 0
     bad: bool = False
+    times: Optional[int] = None  # None: fail every time; n: fail the next n calls only
+    skip: int = 0  # let this many calls pass before failing
 
 
 @dataclass
@@ -46,7 +49,10 @@ class Folder:
 
 
 class FakeIMAP:
+    instances: list = []
+
     def __init__(self, capabilities=("IMAP4REV1", "UIDPLUS", "MOVE", "SPECIAL-USE")):
+        FakeIMAP.instances.append(self)
         self.server_capabilities = {c.upper() for c in capabilities}
         self.capabilities = ("IMAP4REV1",)  # like imaplib 3.12: the stale pre-login list
         self.capability_data = None
@@ -71,8 +77,8 @@ class FakeIMAP:
         folder.messages[uid] = {"flags": set(flags), "raw": raw if raw is not None else make_message()}
         return uid
 
-    def fail_on(self, command, status="NO", apply_first=0, bad=False):
-        self.failures[command.upper()] = Failure(status, apply_first, bad)
+    def fail_on(self, command, status="NO", apply_first=0, bad=False, times=None, skip=0):
+        self.failures[command.upper()] = Failure(status, apply_first, bad, times, skip)
 
     def flags_of(self, raw_folder, uid):
         return set(self.folders[raw_folder].messages[uid]["flags"])
@@ -129,8 +135,13 @@ class FakeIMAP:
 
     def _failure(self, command, uids):
         failure = self.failures.get(command)
-        if failure is None:
+        if failure is None or failure.times == 0:
             return None, uids
+        if failure.skip > 0:
+            failure.skip -= 1
+            return None, uids
+        if failure.times is not None:
+            failure.times -= 1
         return failure, uids[:failure.apply_first]
 
     def _raise_or_status(self, failure, command):
@@ -209,6 +220,9 @@ class FakeIMAP:
 
     def _uid_search(self, charset, *criteria):
         folder = self._selected_folder()
+        failure, _ = self._failure("SEARCH", [])
+        if failure:
+            return self._raise_or_status(failure, "SEARCH")
         uids = sorted(folder.messages)
         if criteria and criteria[0] == "UID":
             wanted = set(self._uid_set(criteria[1]))

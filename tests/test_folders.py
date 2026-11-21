@@ -279,7 +279,7 @@ def seed_inbox(fake):
 def test_move_resolves_destination_with_spaces(fake):
     seed_inbox(fake)
     result = call_json("move", {"uid": "2", "destination_folder": "WIP - In Arbeit", "account": "alpha"})
-    assert result["to_folder"] == "WIP - In Arbeit"
+    assert result["destination_folder"] == "WIP - In Arbeit"
     assert ("uid", "MOVE", "2", '"WIP - In Arbeit"') in fake.commands
     assert fake.uids_of("INBOX") == []
 

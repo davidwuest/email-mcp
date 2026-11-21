@@ -41,7 +41,7 @@ def test_folder_with_spaces_works_without_manual_quoting(mailbox):
     listed = call_json("list_emails", {"folder": "WIP - In Arbeit", "account": "test", "limit": 5})
     assert listed["count"] == 0
     moved = call_json("move", {"uid": "1", "destination_folder": "WIP - In Arbeit", "account": "test"})
-    assert moved["status"] == "moved" and moved["to_folder"] == "WIP - In Arbeit"
+    assert moved["status"] == "ok" and moved["destination_folder"] == "WIP - In Arbeit"
     assert mailbox.uids("WIP - In Arbeit") == [1]
     assert mailbox.uids("INBOX") == []
 
