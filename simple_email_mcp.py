@@ -29,7 +29,8 @@ from email import encoders
 from email.header import decode_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime, formatdate, make_msgid, getaddresses, formataddr
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, NamedTuple, Callable
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -781,24 +782,312 @@ def _compose_and_send(
     if sent_warning: result["warning"] = sent_warning
     return result
 
-# ─── Action schemas for lazy discovery ──────────────────────────────────────
-ACTION_SCHEMAS: Dict[str, Any] = {
-    "validate_config":    {"description": "Validate accounts.json or environment configuration without logging into IMAP/SMTP.", "params": {}},
-    "list_accounts":      {"description": "List configured email accounts.", "params": {}},
-    "list_folders":       {"description": "List IMAP folders.", "params": {"account": "str, optional"}},
-    "list_emails":        {"description": "List recent emails.", "params": {"account": "str, optional", "folder": "str, default=INBOX", "limit": "int, default=20, max=100"}},
-    "search":             {"description": "Search emails (IMAP: FROM, TO, SUBJECT, BODY, SINCE, BEFORE, UNSEEN, SEEN, FLAGGED). Example: 'FROM john SINCE 01-Feb-2025'", "params": {"query": "str, required", "account": "str, optional", "folder": "str, default=INBOX", "limit": "int, default=20"}},
-    "read":               {"description": "Read full email by UID.", "params": {"uid": "str, required", "account": "str, optional", "folder": "str, default=INBOX"}},
-    "send":               {"description": "Send email. confirmation_code required if send_code configured.", "params": {"to": "str, required", "subject": "str, required", "body": "str, required", "account": "str, optional", "cc": "str, optional", "bcc": "str, optional", "body_html": "str, optional", "attachments": "str, optional (comma-separated paths)", "attachments_inline": 'str, optional (JSON: [{"filename":"f.pdf","content_base64":"...","content_type":"..."}])', "calendar_ics": "str, optional", "confirmation_code": "str, optional"}},
-    "reply":              {"description": "Reply to an email.", "params": {"uid": "str, required", "body": "str, required", "account": "str, optional", "folder": "str, default=INBOX", "body_html": "str, optional", "attachments": "str, optional", "confirmation_code": "str, optional"}},
-    "reply_all":          {"description": "Reply to all recipients.", "params": {"uid": "str, required", "body": "str, required", "account": "str, optional", "folder": "str, default=INBOX", "body_html": "str, optional", "attachments": "str, optional", "confirmation_code": "str, optional"}},
-    "forward":            {"description": "Forward an email.", "params": {"uid": "str, required", "to": "str, required", "account": "str, optional", "folder": "str, default=INBOX", "body": "str, optional", "include_attachments": "bool, default=true", "attachments": "str, optional", "confirmation_code": "str, optional"}},
-    "move":               {"description": "Move email to another folder.", "params": {"uid": "str, required", "destination_folder": "str, required", "account": "str, optional", "source_folder": "str, default=INBOX"}},
-    "mark":               {"description": "Mark email read/unread/flag/unflag.", "params": {"uid": "str, required", "action": "read|unread|flag|unflag", "account": "str, optional", "folder": "str, default=INBOX"}},
-    "save_attachment":    {"description": "Save attachment to disk.", "params": {"uid": "str, required", "attachment_index": "int, required", "save_path": "str, required", "account": "str, optional", "folder": "str, default=INBOX", "overwrite": "bool, default=false"}},
-    "get_attachment":     {"description": "Get attachment as base64 (prefer save_attachment).", "params": {"uid": "str, required", "attachment_index": "int, required", "account": "str, optional", "folder": "str, default=INBOX"}},
-    "prepare_attachments":{"description": "Inspect local files before attaching.", "params": {"attachments": "str, required (comma-separated paths)"}},
+# ─── Action schemas and parameter validation ─────────────────────────────────
+
+@dataclass(frozen=True)
+class Param:
+    kind: str
+    description: str
+    required: bool = False
+    default: Any = None
+    min: Optional[int] = None
+    max: Optional[int] = None
+    choices: tuple = ()
+    single_line: bool = False
+    blank_is_absent: bool = False
+    type_hint: str = ""
+
+@dataclass(frozen=True)
+class ActionSchema:
+    description: str
+    params: Dict[str, Param]
+    rules: tuple = ()  # callables (values) -> list of problem dicts, run after the single-field checks
+
+class Addresses(NamedTuple):
+    raw: str
+    pairs: tuple
+
+_ATTACHMENT_PATHS = "comma-separated file paths"
+_INLINE_JSON = '[{"filename":"f.pdf","content_base64":"...","content_type":"..."}]'
+
+def _account_param() -> Param:
+    return Param("str", "account name or address; required when several accounts are configured")
+
+def _folder_param(description: str = "folder name as shown by list_folders ('name' or 'raw_name')") -> Param:
+    return Param("folder", description, default="INBOX")
+
+_UID = Param("uid", "UID of the email", required=True)
+_BODY_HTML = Param("str", "HTML body", blank_is_absent=True)
+_ATTACHMENTS = Param("str", _ATTACHMENT_PATHS, blank_is_absent=True)
+_ATTACHMENTS_INLINE = Param("json_array", "JSON array " + _INLINE_JSON, blank_is_absent=True)
+_CONFIRMATION = Param("str", "required if a send_code is configured", single_line=True, type_hint="pass the code as a string")
+
+ACTION_SCHEMAS: Dict[str, ActionSchema] = {
+    "validate_config": ActionSchema("Validate accounts.json or environment configuration without logging into IMAP/SMTP.", {}),
+    "list_accounts": ActionSchema("List configured email accounts.", {}),
+    "list_folders": ActionSchema("List IMAP folders.", {"account": _account_param()}),
+    "list_emails": ActionSchema("List recent emails.", {
+        "account": _account_param(), "folder": _folder_param(),
+        "limit": Param("int", "number of emails", default=20, min=1, max=100)}),
+    "search": ActionSchema("Search emails (IMAP: FROM, TO, SUBJECT, BODY, SINCE, BEFORE, UNSEEN, SEEN, FLAGGED). Example: 'FROM john SINCE 01-Feb-2025'", {
+        "query": Param("str", "IMAP search query", required=True), "account": _account_param(),
+        "folder": _folder_param(), "limit": Param("int", "number of emails", default=20, min=1)}),
+    "read": ActionSchema("Read full email by UID.", {"uid": _UID, "account": _account_param(), "folder": _folder_param()}),
+    "send": ActionSchema("Send email. confirmation_code required if send_code configured.", {
+        "to": Param("addresses", "recipient address(es)", required=True),
+        "subject": Param("str", "subject line", required=True, single_line=True),
+        "body": Param("str", "plain text body", required=True),
+        "account": _account_param(),
+        "cc": Param("addresses", "Cc address(es)", blank_is_absent=True),
+        "bcc": Param("addresses", "Bcc address(es)", blank_is_absent=True),
+        "body_html": _BODY_HTML, "attachments": _ATTACHMENTS, "attachments_inline": _ATTACHMENTS_INLINE,
+        "calendar_ics": Param("str", "iCalendar text to attach as an invite", blank_is_absent=True),
+        "confirmation_code": _CONFIRMATION,
+        "reply_to_uid": Param("uid", "thread this mail as a reply to the message with this UID (sets In-Reply-To/References)"),
+        "reply_to_folder": _folder_param("folder holding reply_to_uid"),
+    }),
+    "reply": ActionSchema("Reply to an email.", {
+        "uid": _UID, "body": Param("str", "plain text reply", required=True), "account": _account_param(),
+        "folder": _folder_param(), "body_html": _BODY_HTML, "attachments": _ATTACHMENTS,
+        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
+    "reply_all": ActionSchema("Reply to all recipients.", {
+        "uid": _UID, "body": Param("str", "plain text reply", required=True), "account": _account_param(),
+        "folder": _folder_param(), "body_html": _BODY_HTML, "attachments": _ATTACHMENTS,
+        "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
+    "forward": ActionSchema("Forward an email.", {
+        "uid": _UID, "to": Param("addresses", "recipient address(es)", required=True), "account": _account_param(),
+        "folder": _folder_param(), "body": Param("str", "text added above the forwarded message"),
+        "body_html": _BODY_HTML, "include_attachments": Param("bool", "forward the original attachments", default=True),
+        "attachments": _ATTACHMENTS, "attachments_inline": _ATTACHMENTS_INLINE, "confirmation_code": _CONFIRMATION}),
+    "move": ActionSchema("Move email to another folder.", {
+        "uid": _UID, "destination_folder": Param("folder", "target folder", required=True), "account": _account_param(),
+        "source_folder": _folder_param("folder the email is in")}),
+    "mark": ActionSchema("Mark email read/unread/flag/unflag.", {
+        "uid": _UID, "action": Param("choice", "what to set", required=True, choices=("read", "unread", "flag", "unflag")),
+        "account": _account_param(), "folder": _folder_param()}),
+    "save_attachment": ActionSchema("Save attachment to disk.", {
+        "uid": _UID, "attachment_index": Param("int", "index from read", required=True, min=0),
+        "save_path": Param("str", "target path on disk", required=True), "account": _account_param(),
+        "folder": _folder_param(), "overwrite": Param("bool", "replace an existing file", default=False)}),
+    "get_attachment": ActionSchema("Get attachment as base64 (prefer save_attachment).", {
+        "uid": _UID, "attachment_index": Param("int", "index from read", required=True, min=0),
+        "account": _account_param(), "folder": _folder_param()}),
+    "prepare_attachments": ActionSchema("Inspect local files before attaching.", {
+        "attachments": Param("str", _ATTACHMENT_PATHS, required=True)}),
 }
+
+# ─── Validation (the only place where caller input is checked) ───────────────
+
+_MAX_UID = 4294967295
+
+class _Invalid(Exception):
+    def __init__(self, problem: str, **extra: Any):
+        super().__init__(problem)
+        self.problem = problem
+        self.extra = extra
+
+def _json_type(value: Any) -> str:
+    if value is None: return "null"
+    if isinstance(value, bool): return "boolean"
+    if isinstance(value, (int, float)): return "number"
+    if isinstance(value, str): return "string"
+    if isinstance(value, list): return "array"
+    if isinstance(value, dict): return "object"
+    return "other"
+
+def _wrong_type(param: Param, value: Any, **extra: Any) -> _Invalid:
+    if param.type_hint:
+        extra["hint"] = param.type_hint
+    return _Invalid("wrong_type", expected=param.kind, got=_json_type(value), **extra)
+
+def _range_check(number: int, low: Optional[int], high: Optional[int]) -> int:
+    if (low is not None and number < low) or (high is not None and number > high):
+        extra = {key: bound for key, bound in (("min", low), ("max", high)) if bound is not None}
+        raise _Invalid("out_of_range", **extra)
+    return number
+
+def _to_int(value: Any, param: Param) -> int:
+    if isinstance(value, bool):
+        raise _wrong_type(param, value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        if len(value) > 20:
+            raise _Invalid("out_of_range", **{key: bound for key, bound in (("min", param.min), ("max", param.max)) if bound is not None})
+        return int(value)
+    raise _wrong_type(param, value)
+
+def _coerce_str(value: Any, param: Param) -> str:
+    if not isinstance(value, str):
+        raise _wrong_type(param, value)
+    if param.single_line and re.search(r"[\r\n\x00\u2028\u2029]", value):
+        raise _Invalid("invalid_value", hint="must be a single line")
+    return value
+
+def _coerce_int(value: Any, param: Param) -> int:
+    return _range_check(_to_int(value, param), param.min, param.max)
+
+def _coerce_uid(value: Any, param: Param) -> int:
+    return _range_check(_to_int(value, param), 1, _MAX_UID)
+
+def _coerce_bool(value: Any, param: Param) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise _wrong_type(param, value)
+
+def _coerce_strict_bool(value: Any, param: Param) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise _wrong_type(param, value)
+
+def _coerce_folder(value: Any, param: Param) -> str:
+    if not isinstance(value, str):
+        raise _wrong_type(param, value)
+    if not value or re.search(r"[\r\n\x00]", value):
+        raise _Invalid("invalid_value", hint="must be a non-empty folder name without line breaks")
+    return value
+
+def _coerce_addresses(value: Any, param: Param) -> Addresses:
+    if not isinstance(value, str):
+        raise _wrong_type(param, value)
+    if re.search(r"[\r\n\x00]", value):
+        raise _Invalid("invalid_value", hint="must not contain line breaks")
+    pairs = [(name, addr.strip()) for name, addr in getaddresses([value])]
+    for index, (_, addr) in enumerate(pairs):
+        if not _looks_like_email(addr) or re.search(r"\s", addr):
+            raise _Invalid("invalid_address", index=index)
+    if not pairs:
+        raise _Invalid("invalid_address")
+    return Addresses(value, tuple(pairs))
+
+def _coerce_json_array(value: Any, param: Param) -> str:
+    if not isinstance(value, str):
+        raise _wrong_type(param, value)
+    return value
+
+def _coerce_choice(value: Any, param: Param) -> str:
+    if not isinstance(value, str):
+        raise _wrong_type(param, value)
+    if value.lower() in param.choices:
+        return value.lower()
+    raise _Invalid("invalid_value", allowed=list(param.choices),
+                   did_you_mean=difflib.get_close_matches(value.lower(), param.choices, n=3, cutoff=0.6))
+
+_COERCERS: Dict[str, Callable[[Any, Param], Any]] = {
+    "str": _coerce_str, "int": _coerce_int, "bool": _coerce_bool, "strict_bool": _coerce_strict_bool,
+    "uid": _coerce_uid, "folder": _coerce_folder, "addresses": _coerce_addresses,
+    "json_array": _coerce_json_array, "choice": _coerce_choice,
+}
+
+_PARAM_SYNONYMS: Dict[str, tuple] = {
+    "target_folder": ("destination_folder",), "to_folder": ("destination_folder",),
+    "dest": ("destination_folder",), "dest_folder": ("destination_folder",),
+    "destination": ("destination_folder",), "folder": ("source_folder", "destination_folder"),
+    "html": ("body_html",), "html_body": ("body_html",),
+    "reply_to_address": ("reply_to",), "replyto": ("reply_to",), "uids": ("uid",),
+}
+
+def _snake_case(name: str) -> str:
+    return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).replace("-", "_").lower()
+
+def _suggest_param(name: str, action: str) -> dict:
+    valid = list(ACTION_SCHEMAS[action].params)
+    normalized = _snake_case(name)
+    if normalized in valid:
+        return {"did_you_mean": [normalized]}
+    if normalized in ("from", "sender") and "account" in valid:
+        return {"hint": "the sender is the account; use 'account'"}
+    synonyms = [target for target in _PARAM_SYNONYMS.get(normalized, ()) if target in valid]
+    if synonyms:
+        return {"did_you_mean": synonyms}
+    close = difflib.get_close_matches(normalized, valid, n=3, cutoff=0.6)
+    return {"did_you_mean": close} if close else {}
+
+def _suggest_action(name: str) -> list:
+    return difflib.get_close_matches(_snake_case(str(name)).strip(), list(ACTION_SCHEMAS), n=3, cutoff=0.6)
+
+def _validate_params(action: str, params: Dict[str, Any]) -> tuple[Dict[str, Any], list]:
+    schema = ACTION_SCHEMAS[action]
+    values: Dict[str, Any] = {}
+    problems: list = []
+    for name in params:
+        if name not in schema.params:
+            problems.append({"param": name, "problem": "unknown_param", **_suggest_param(name, action)})
+    for name, param in schema.params.items():
+        value = params.get(name)
+        if value is None or (param.blank_is_absent and value == ""):
+            if param.required:
+                problems.append({"param": name, "problem": "missing"})
+            elif param.default is not None:
+                values[name] = param.default
+            continue
+        try:
+            values[name] = _COERCERS[param.kind](value, param)
+        except _Invalid as invalid:
+            problems.append({"param": name, "problem": invalid.problem, **invalid.extra})
+    if not problems:
+        for rule in schema.rules:
+            problems.extend(rule(values))
+    return values, problems
+
+_KIND_LABELS = {"str": "str", "int": "int", "bool": "bool", "strict_bool": "bool", "uid": "int",
+                "folder": "str", "addresses": "str (comma-separated addresses)", "json_array": "str (JSON array)"}
+
+def _describe_param(param: Param) -> str:
+    label = "|".join(param.choices) if param.kind == "choice" else _KIND_LABELS[param.kind]
+    parts = [label, "required" if param.required else "optional"]
+    if param.default is not None:
+        parts.append(f"default={str(param.default).lower() if isinstance(param.default, bool) else param.default}")
+    if param.min is not None or param.max is not None:
+        parts.append(f"{'' if param.min is None else param.min}-{'' if param.max is None else param.max}")
+    return f"{param.description} ({', '.join(parts)})"
+
+def _schema_view(action: str) -> dict:
+    schema = ACTION_SCHEMAS[action]
+    return {"action": action, "description": schema.description,
+            "params": {name: _describe_param(param) for name, param in schema.params.items()}}
+
+def _problem_text(action: str, problem: dict) -> str:
+    name, kind = problem["param"], problem["problem"]
+    if kind == "unknown_param":
+        if problem.get("did_you_mean"):
+            return f"unknown param '{name}' (did you mean {' or '.join(repr(n) for n in problem['did_you_mean'])}?)"
+        if problem.get("hint"):
+            return f"unknown param '{name}' ({problem['hint']})"
+        return f"unknown param '{name}' (valid params: {', '.join(ACTION_SCHEMAS[action].params) or 'none'})"
+    if kind == "missing":
+        return f"missing required param '{name}'"
+    if kind == "wrong_type":
+        text = f"'{name}' must be of type {problem['expected']} (got {problem['got']})"
+        return text + (f"; {problem['hint']}" if problem.get("hint") else "")
+    if kind == "out_of_range":
+        return f"'{name}' is out of range ({problem.get('min', '')}-{problem.get('max', '')})"
+    if kind == "invalid_value":
+        text = f"'{name}' has an invalid value"
+        if problem.get("allowed"):
+            text += f" (allowed: {', '.join(problem['allowed'])})"
+        if problem.get("did_you_mean"):
+            text += f" (did you mean {' or '.join(repr(n) for n in problem['did_you_mean'])}?)"
+        return text + (f"; {problem['hint']}" if problem.get("hint") else "")
+    if kind == "invalid_address":
+        return f"'{name}' contains an invalid email address"
+    if kind == "conflict":
+        return f"'{name}' cannot be combined with '{problem.get('with')}'"
+    return f"'{name}' is invalid ({kind})"
+
+def _validation_error(action: str, problems: list) -> str:
+    texts = "; ".join(_problem_text(action, p) for p in problems)
+    return json.dumps({"error": f"Invalid params for action '{action}': {texts}.", "problems": problems, **_schema_view(action)})
+
+def _unknown_action(action: Any) -> str:
+    suggestions = _suggest_action(action)
+    text = "Unknown action"
+    if suggestions:
+        text += f" (did you mean {' or '.join(repr(n) for n in suggestions)}?)"
+    problems = [{"param": "action", "problem": "invalid_value", "did_you_mean": suggestions}]
+    return json.dumps({"error": text, "problems": problems, "available_actions": list(ACTION_SCHEMAS)})
 
 # ─── Internal handlers ───────────────────────────────────────────────────────
 
@@ -923,6 +1212,9 @@ async def _do_read(account: Optional[str], uid: str, folder: str) -> str:
     except Exception as e:
         return f"Error reading email: {e}"
 
+def _raw_addresses(p: Dict[str, Any], name: str) -> Optional[str]:
+    return p[name].raw if p.get(name) else None
+
 async def _do_send(p: Dict[str, Any]) -> str:
     blocked = _check_confirmation_code(p.get("confirmation_code"))
     if blocked:
@@ -932,8 +1224,8 @@ async def _do_send(p: Dict[str, Any]) -> str:
         in_reply_to = references = None
         if p.get("reply_to_uid"):
             with _imap_session(acct) as conn:
-                opened = _open_folder(conn, p.get("reply_to_folder", "INBOX"), "reply_to_folder")
-                status, msg_data = conn.uid("fetch", p["reply_to_uid"], "(RFC822.HEADER)")
+                opened = _open_folder(conn, p["reply_to_folder"], "reply_to_folder")
+                status, msg_data = conn.uid("fetch", str(p["reply_to_uid"]), "(RFC822.HEADER)")
                 raw = msg_data[0][1] if status == "OK" and msg_data and isinstance(msg_data[0], tuple) else (msg_data[0] if status == "OK" and msg_data else None)
                 if not isinstance(raw, bytes):
                     return f"Error: reply_to_uid {p['reply_to_uid']} not found in folder '{opened['name']}'; nothing was sent."
@@ -941,7 +1233,7 @@ async def _do_send(p: Dict[str, Any]) -> str:
                 if orig_id:
                     in_reply_to = orig_id
                     references = orig_id
-        result = _compose_and_send(acct, p["to"], p["subject"], p["body"], body_html=p.get("body_html"), cc=p.get("cc"), bcc=p.get("bcc"), in_reply_to=in_reply_to, references=references, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), calendar_ics=p.get("calendar_ics"))
+        result = _compose_and_send(acct, p["to"].raw, p["subject"], p["body"], body_html=p.get("body_html"), cc=_raw_addresses(p, "cc"), bcc=_raw_addresses(p, "bcc"), in_reply_to=in_reply_to, references=references, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), calendar_ics=p.get("calendar_ics"))
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
@@ -956,12 +1248,12 @@ async def _do_reply(p: Dict[str, Any]) -> str:
         return blocked
     try:
         acct = _resolve_account(p.get("account"))
-        folder = p.get("folder", "INBOX")
+        uid = str(p["uid"])
         with _imap_session(acct) as conn:
-            _open_folder(conn, folder)
-            status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
+            _open_folder(conn, p["folder"])
+            status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
-                return f"Error: Could not fetch email UID {p['uid']}."
+                return f"Error: Could not fetch email UID {uid}."
             raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
             if not isinstance(raw, bytes):
                 return "Error: Unexpected response format."
@@ -995,12 +1287,12 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
         return blocked
     try:
         acct = _resolve_account(p.get("account"))
-        folder = p.get("folder", "INBOX")
+        uid = str(p["uid"])
         with _imap_session(acct) as conn:
-            _open_folder(conn, folder)
-            status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
+            _open_folder(conn, p["folder"])
+            status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
-                return f"Error: Could not fetch email UID {p['uid']}."
+                return f"Error: Could not fetch email UID {uid}."
             raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
             if not isinstance(raw, bytes):
                 return "Error: Unexpected response format."
@@ -1045,12 +1337,12 @@ async def _do_forward(p: Dict[str, Any]) -> str:
         return blocked
     try:
         acct = _resolve_account(p.get("account"))
-        folder = p.get("folder", "INBOX")
+        uid = str(p["uid"])
         with _imap_session(acct) as conn:
-            _open_folder(conn, folder)
-            status, msg_data = conn.uid("fetch", p["uid"], "(RFC822)")
+            _open_folder(conn, p["folder"])
+            status, msg_data = conn.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
-                return f"Error: Could not fetch email UID {p['uid']}."
+                return f"Error: Could not fetch email UID {uid}."
             raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
             if not isinstance(raw, bytes):
                 return "Error: Unexpected response format."
@@ -1074,7 +1366,7 @@ async def _do_forward(p: Dict[str, Any]) -> str:
             for part in orig.walk():
                 if _is_attachment_part(part):
                     forwarded_parts.append(part)
-        result = _compose_and_send(acct, p["to"], subject, full_body, body_html=full_body_html, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), forwarded_parts=forwarded_parts)
+        result = _compose_and_send(acct, p["to"].raw, subject, full_body, body_html=full_body_html, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), forwarded_parts=forwarded_parts)
         if "error" in result:
             return f"Error: {result['error']}"
         return json.dumps(result, indent=2)
@@ -1122,9 +1414,7 @@ async def _do_mark(account: Optional[str], uid: str, folder: str, action: str) -
         with _imap_session(acct) as conn:
             _open_folder(conn, folder, readonly=False)
             flag_map = {"read": ("+FLAGS", "(\\Seen)"), "unread": ("-FLAGS", "(\\Seen)"), "flag": ("+FLAGS", "(\\Flagged)"), "unflag": ("-FLAGS", "(\\Flagged)")}
-            if action.lower() not in flag_map:
-                return f"Error: action must be one of: {', '.join(flag_map)}"
-            op, flag = flag_map[action.lower()]
+            op, flag = flag_map[action]
             status, _ = conn.uid("store", uid, op, flag)
             if status != "OK":
                 return f"Error: Could not mark email as '{action}'."
@@ -1205,11 +1495,13 @@ async def _do_prepare_attachments(attachments: str) -> str:
 @mcp.tool(name="email")
 async def email_dispatcher(action: str, params: Optional[Dict[str, Any]] = None) -> str:
     """Email client (IMAP/SMTP). Call with just action to discover its parameters. Actions: validate_config, list_accounts, list_folders, list_emails, search, read, send, reply, reply_all, forward, move, mark, save_attachment, get_attachment, prepare_attachments."""
+    if action not in ACTION_SCHEMAS:
+        return _unknown_action(action)
     if params is None:
-        if action not in ACTION_SCHEMAS:
-            return json.dumps({"error": f"Unknown action '{action}'", "available_actions": list(ACTION_SCHEMAS.keys())})
-        return json.dumps({"action": action, **ACTION_SCHEMAS[action]})
-    p = params
+        return json.dumps(_schema_view(action))
+    p, problems = _validate_params(action, params)
+    if problems:
+        return _validation_error(action, problems)
     if action == "validate_config":
         return await _do_validate_config()
     elif action == "list_accounts":
@@ -1217,50 +1509,29 @@ async def email_dispatcher(action: str, params: Optional[Dict[str, Any]] = None)
     elif action == "list_folders":
         return await _do_list_folders(p.get("account"))
     elif action == "list_emails":
-        return await _do_list_emails(p.get("account"), p.get("folder", "INBOX"), int(p.get("limit", 20)))
+        return await _do_list_emails(p.get("account"), p["folder"], p["limit"])
     elif action == "search":
-        if "query" not in p: return json.dumps({"error": "Missing required param: query", **ACTION_SCHEMAS["search"]})
-        return await _do_search(p.get("account"), p["query"], p.get("folder", "INBOX"), int(p.get("limit", 20)))
+        return await _do_search(p.get("account"), p["query"], p["folder"], p["limit"])
     elif action == "read":
-        if "uid" not in p: return json.dumps({"error": "Missing required param: uid", **ACTION_SCHEMAS["read"]})
-        return await _do_read(p.get("account"), p["uid"], p.get("folder", "INBOX"))
+        return await _do_read(p.get("account"), str(p["uid"]), p["folder"])
     elif action == "send":
-        for req in ("to", "subject", "body"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["send"]})
         return await _do_send(p)
     elif action == "reply":
-        for req in ("uid", "body"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["reply"]})
         return await _do_reply(p)
     elif action == "reply_all":
-        for req in ("uid", "body"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["reply_all"]})
         return await _do_reply_all(p)
     elif action == "forward":
-        for req in ("uid", "to"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["forward"]})
         return await _do_forward(p)
     elif action == "move":
-        for req in ("uid", "destination_folder"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["move"]})
-        return await _do_move(p.get("account"), p["uid"], p.get("source_folder", "INBOX"), p["destination_folder"])
+        return await _do_move(p.get("account"), str(p["uid"]), p["source_folder"], p["destination_folder"])
     elif action == "mark":
-        for req in ("uid", "action"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["mark"]})
-        return await _do_mark(p.get("account"), p["uid"], p.get("folder", "INBOX"), p["action"])
+        return await _do_mark(p.get("account"), str(p["uid"]), p["folder"], p["action"])
     elif action == "save_attachment":
-        for req in ("uid", "attachment_index", "save_path"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["save_attachment"]})
-        return await _do_save_attachment(p.get("account"), p["uid"], p.get("folder", "INBOX"), int(p["attachment_index"]), p["save_path"], bool(p.get("overwrite", False)))
+        return await _do_save_attachment(p.get("account"), str(p["uid"]), p["folder"], p["attachment_index"], p["save_path"], p["overwrite"])
     elif action == "get_attachment":
-        for req in ("uid", "attachment_index"):
-            if req not in p: return json.dumps({"error": f"Missing required param: {req}", **ACTION_SCHEMAS["get_attachment"]})
-        return await _do_get_attachment(p.get("account"), p["uid"], p.get("folder", "INBOX"), int(p["attachment_index"]))
-    elif action == "prepare_attachments":
-        if "attachments" not in p: return json.dumps({"error": "Missing required param: attachments", **ACTION_SCHEMAS["prepare_attachments"]})
-        return await _do_prepare_attachments(p["attachments"])
+        return await _do_get_attachment(p.get("account"), str(p["uid"]), p["folder"], p["attachment_index"])
     else:
-        return json.dumps({"error": f"Unknown action '{action}'", "available_actions": list(ACTION_SCHEMAS.keys())})
+        return await _do_prepare_attachments(p["attachments"])
 
 def main():
     mcp.run()
