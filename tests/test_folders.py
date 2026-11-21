@@ -17,7 +17,7 @@ def folder(raw_name, flags=(), delimiter="/"):
 
 # ── LIST parser ───────────────────────────────────────────────────────────────
 
-def test_parser_reads_the_migadu_style_line():
+def test_parser_reads_a_quoted_name_with_encoded_umlaut():
     parsed = m._parse_imap_list_response([b'(\\HasNoChildren) "/" "INBOX/Flu&Awg-ge"'])
     assert parsed[0]["raw_name"] == "INBOX/Flu&Awg-ge"
     assert parsed[0]["delimiter"] == "/"
