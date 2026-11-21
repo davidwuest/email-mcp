@@ -307,6 +307,22 @@ def _imap_connect(acct: Dict[str, Any]) -> imaplib.IMAP4_SSL:
     conn.login(acct["address"], acct["password"])
     return conn
 
+def _imap_capabilities(conn: imaplib.IMAP4_SSL) -> frozenset:
+    # imaplib 3.12 keeps the capability list from before the login, so ask again.
+    status, data = conn.capability()
+    if status != "OK" or not data:
+        raise RuntimeError("Could not query server capabilities.")
+    last = data[-1]
+    text = last.decode("ascii", errors="replace") if isinstance(last, bytes) else str(last)
+    return frozenset(text.upper().split())
+
+def _move_method(capabilities: frozenset) -> Optional[str]:
+    if "MOVE" in capabilities or "IMAP4REV2" in capabilities:
+        return "move"
+    if "UIDPLUS" in capabilities:
+        return "copy_expunge"
+    return None
+
 @contextmanager
 def _imap_session(acct: Dict[str, Any], folder: Optional[str] = None, readonly: bool = True):
     last_err = None
@@ -930,11 +946,23 @@ async def _do_move(account: Optional[str], uid: str, source_folder: str, destina
     try:
         acct = _resolve_account(account)
         with _imap_session(acct, folder=source_folder, readonly=False) as conn:
-            status, _ = conn.uid("copy", uid, destination_folder)
-            if status != "OK":
-                return f"Error: Could not copy email to '{destination_folder}'."
-            conn.uid("store", uid, "+FLAGS", "(\\Deleted)")
-            conn.expunge()
+            method = _move_method(_imap_capabilities(conn))
+            if method is None:
+                return "Error: server supports neither MOVE nor UIDPLUS; refusing to move because a plain EXPUNGE could delete other messages."
+            if method == "move":
+                status, _ = conn.uid("move", uid, destination_folder)
+                if status != "OK":
+                    return f"Error: Could not move email to '{destination_folder}'."
+            else:
+                status, _ = conn.uid("copy", uid, destination_folder)
+                if status != "OK":
+                    return f"Error: Could not copy email to '{destination_folder}'."
+                status, _ = conn.uid("store", uid, "+FLAGS.SILENT", "(\\Deleted)")
+                if status != "OK":
+                    return f"Error: Email was copied to '{destination_folder}' but could not be marked for removal from '{source_folder}'; it now exists in both folders."
+                status, _ = conn.uid("expunge", uid)
+                if status != "OK":
+                    return f"Error: Email was copied to '{destination_folder}' but could not be removed from '{source_folder}'; it remains there flagged \\Deleted."
             return json.dumps({"status": "moved", "account": acct["address"], "uid": uid, "from_folder": source_folder, "to_folder": destination_folder}, indent=2)
     except Exception as e:
         return f"Error moving email: {e}"
