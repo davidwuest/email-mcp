@@ -869,7 +869,7 @@ ACTION_SCHEMAS: Dict[str, ActionSchema] = {
         "account": _account_param(), "folder": _folder_param(),
         "limit": Param("int", "number of emails", default=20, min=1, max=100)}),
     "search": ActionSchema("Search emails (IMAP: FROM, TO, SUBJECT, BODY, SINCE, BEFORE, UNSEEN, SEEN, FLAGGED). Example: 'FROM john SINCE 01-Feb-2025'", {
-        "query": Param("str", "IMAP search query", required=True), "account": _account_param(),
+        "query": Param("str", "IMAP search query", required=True, single_line=True), "account": _account_param(),
         "folder": _folder_param(), "limit": Param("int", "number of emails", default=20, min=1)}),
     "read": ActionSchema("Read full email by UID.", {"uid": _UID, "account": _account_param(), "folder": _folder_param()}),
     "send": ActionSchema("Send email. confirmation_code required if send_code configured.", {
@@ -957,10 +957,12 @@ def _to_int(value: Any, param: Param) -> int:
         return int(value)
     raise _wrong_type(param, value)
 
+_HEADER_UNSAFE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+
 def _coerce_str(value: Any, param: Param) -> str:
     if not isinstance(value, str):
         raise _wrong_type(param, value)
-    if param.single_line and re.search(r"[\r\n\x00\u2028\u2029]", value):
+    if param.single_line and _HEADER_UNSAFE.search(value):
         raise _Invalid("invalid_value", hint="must be a single line")
     return value
 
@@ -1006,8 +1008,8 @@ def _coerce_folder(value: Any, param: Param) -> str:
 def _coerce_addresses(value: Any, param: Param) -> Addresses:
     if not isinstance(value, str):
         raise _wrong_type(param, value)
-    if re.search(r"[\r\n\x00]", value):
-        raise _Invalid("invalid_value", hint="must not contain line breaks")
+    if _HEADER_UNSAFE.search(value):
+        raise _Invalid("invalid_value", hint="must not contain line breaks or control characters")
     pairs = [(name, addr.strip()) for name, addr in getaddresses([value])]
     for index, (_, addr) in enumerate(pairs):
         if not _looks_like_email(addr) or re.search(r"\s", addr):

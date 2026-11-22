@@ -63,6 +63,14 @@ One tool, `email`, takes `action` and `params`. Call it with just `action` to ge
 - **move / mark:** `uid` is one UID or a list (up to 500). UIDs that do not exist do not stop the others. The answer has `status` (`ok`, `partial`, `failed`) and the lists `moved` or `marked`, `not_found`, `failed` (`move` also `duplicated`), plus `error` when something failed.
 - **move** uses `UID MOVE` when the server offers `MOVE` or `IMAP4rev2`, otherwise `UID COPY` + `UID STORE \Deleted` + `UID EXPUNGE` of exactly those UIDs (`UIDPLUS`). Without either it refuses and changes nothing, because a plain `EXPUNGE` would delete every message marked `\Deleted` in the folder.
 
+## Changes for callers
+
+- `limit: 0` is rejected, and so is a `limit` above 100 where a maximum applies (`list_emails`).
+- `cc` on `forward` is rejected.
+- Folder names no longer need manual quoting. Names that were quoted by hand no longer match.
+- Control characters (including CR, LF, NUL, tab, 0x7f, 0x85, U+2028 and U+2029) in header fields (`subject`, display names in `to`/`cc`/`bcc`/`reply_to`, `confirmation_code`) and in `search.query` are rejected. The message body is not restricted.
+- Unknown parameters are rejected, with suggestions for close matches.
+
 ## Tests
 
 Tests run on Python 3.12, like the image:

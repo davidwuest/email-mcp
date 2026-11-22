@@ -113,6 +113,12 @@ def test_nfc_input_matches_an_nfd_server_name():
     assert m._match_folder(FOLDERS, "INBOX/" + NFC_FLUEGE, "folder")["raw_name"] == "INBOX/Flu&Awg-ge"
 
 
+def test_nfd_input_matches_the_server_name():
+    nfd = "INBOX/Flu\u0308ge"
+    assert nfd != "INBOX/" + NFC_FLUEGE
+    assert m._match_folder(FOLDERS, nfd, "folder")["raw_name"] == "INBOX/Flu&Awg-ge"
+
+
 def test_raw_name_matches_directly():
     assert m._match_folder(FOLDERS, "INBOX/Flu&Awg-ge", "folder")["raw_name"] == "INBOX/Flu&Awg-ge"
 

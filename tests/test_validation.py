@@ -185,6 +185,43 @@ def test_single_line_fields_reject_line_breaks(field):
     assert problems[0]["problem"] == "invalid_value"
 
 
+_CONTROL_CHARS = ["\x0b", "\x0c", "\x85", "\u2028", "\u2029", "\x1f", "\x7f", "\x00", "\r", "\n"]
+
+
+@pytest.mark.parametrize("char", _CONTROL_CHARS)
+@pytest.mark.parametrize("field", ["subject", "confirmation_code", "to", "cc", "bcc", "reply_to"])
+def test_header_fields_reject_control_characters(field, char):
+    value = "Anna%s <a@example.test>" % char if field in ("to", "cc", "bcc", "reply_to") else "a%sb" % char
+    params = {**SEND, field: value}
+    result = problems_of("send", params)
+    assert result and result[0]["problem"] == "invalid_value"
+    assert result[0]["param"] == field
+
+
+def test_header_fields_accept_ordinary_text_and_the_body_stays_unrestricted():
+    values = values_of("send", {**SEND, "subject": "Grüße \U0001F600 café",
+                                "to": "Jürgen Müller <j@example.test>",
+                                "body": "a\tb\x0bc\x85d\u2028e\r\nf"})
+    assert values["subject"] == "Grüße \U0001F600 café"
+    assert values["to"].pairs == (("Jürgen Müller", "j@example.test"),)
+    assert values["body"] == "a\tb\x0bc\x85d\u2028e\r\nf"
+
+
+@pytest.mark.parametrize("char", ["\r", "\n", "\x00", "\x0b", "\x1f", "\x7f"])
+def test_search_query_rejects_control_characters(char):
+    result = problems_of("search", {"query": "ALL%s" % char})
+    assert result and result[0]["problem"] == "invalid_value" and result[0]["param"] == "query"
+
+
+def test_search_query_rejects_an_injected_command_sequence():
+    query = "ALL\r\nX1 UID STORE 1:* +FLAGS (\\Deleted)\r\nX2 EXPUNGE"
+    assert problems_of("search", {"query": query})[0]["problem"] == "invalid_value"
+
+
+def test_normal_search_query_is_accepted():
+    assert values_of("search", {"query": "FROM john SINCE 01-Feb-2025"})["query"] == "FROM john SINCE 01-Feb-2025"
+
+
 def test_strings_must_be_strings():
     assert problems_of("send", {**SEND, "body": 5})[0]["problem"] == "wrong_type"
     assert problems_of("search", {"query": ["ALL"]})[0]["problem"] == "wrong_type"
