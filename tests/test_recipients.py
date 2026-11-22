@@ -1,3 +1,4 @@
+import json
 import email
 from email.header import decode_header
 
@@ -195,3 +196,76 @@ def test_reply_to_spellings_get_a_suggestion(action, name):
 def test_forward_takes_no_cc_bcc_or_reply_to(env, name):
     result = call_json("forward", {"uid": "1", "to": "dave@example.test", name: "x@example.test", "account": "alpha"})
     assert next(p for p in result["problems"] if p["param"] == name)["problem"] == "unknown_param"
+
+
+# ── inbound Message-ID handling and inline attachment names ───────────────────
+
+def _reply_to_message_id(env, action, raw_id):
+    fake, smtp = env
+    fake.add_message("INBOX", make_message(message_id="<orig-2@example.test>").replace(b"<orig-2@example.test>", raw_id), uid=2)
+    result = call_json(action, {"uid": "2", "body": "x", "account": "alpha", "confirmation_code": "4711"})
+    return result, smtp
+
+
+@pytest.mark.parametrize("action", ["reply", "reply_all"])
+def test_a_folded_inbound_message_id_is_unfolded(env, action):
+    result, smtp = _reply_to_message_id(env, action, b"<a@x.test>\r\n <b@x.test>")
+    assert result["status"] == "sent"
+    message = sent(smtp)
+    assert message["In-Reply-To"] == "<a@x.test> <b@x.test>"
+    assert message["References"] == "<a@x.test> <b@x.test>"
+
+
+@pytest.mark.parametrize("action", ["reply", "reply_all"])
+def test_an_inbound_message_id_with_control_characters_is_dropped(env, action):
+    result, smtp = _reply_to_message_id(env, action, b"<a@x.test>\x7f<b@x.test>")
+    assert result["status"] == "sent"
+    message = sent(smtp)
+    assert message["In-Reply-To"] is None and message["References"] is None
+
+
+@pytest.mark.parametrize("raw", ["<a@x.test>\x7f<b@x.test>", "<a@x.test>\x00"])
+def test_inbound_id_helper_drops_values_with_control_characters(raw):
+    assert m._inbound_id_header(raw) == ""
+
+
+def test_inbound_id_helper_turns_whitespace_like_controls_into_spaces():
+    assert m._inbound_id_header("<a@x.test>\x0b<b@x.test>") == "<a@x.test> <b@x.test>"
+    assert m._inbound_id_header("<a@x.test>\x85\x1f<b@x.test>") == "<a@x.test> <b@x.test>"
+
+
+def test_inbound_id_helper_unfolds_and_keeps_normal_values():
+    assert m._inbound_id_header("<a@x.test>\r\n <b@x.test>") == "<a@x.test> <b@x.test>"
+    assert m._inbound_id_header("<plain@x.test>") == "<plain@x.test>"
+    assert m._inbound_id_header(None) == ""
+
+
+def test_a_normal_inbound_message_id_is_unchanged(env):
+    result, smtp = _reply_to_message_id(env, "reply", b"<plain@x.test>")
+    assert result["status"] == "sent"
+    assert sent(smtp)["In-Reply-To"] == "<plain@x.test>"
+
+
+def test_send_threading_uses_the_cleaned_message_id(env):
+    fake, smtp = env
+    fake.add_message("INBOX", make_message().replace(b"<orig-1@example.test>", b"<a@x.test>\r\n <b@x.test>"), uid=3)
+    call_json("send", {"to": "dave@example.test", "subject": "Hi", "body": "Text", "reply_to_uid": "3",
+                       "account": "alpha", "confirmation_code": "4711"})
+    assert sent(smtp)["In-Reply-To"] == "<a@x.test> <b@x.test>"
+
+
+@pytest.mark.parametrize("char", ["\r", "\n", "\x00", "\x0b", "\x7f", "\x85", "\u2028"])
+def test_inline_attachment_filename_with_control_characters_is_rejected(env, char):
+    _, smtp = env
+    inline = json.dumps([{"filename": "a%sb.txt" % char, "content_base64": "aGk=", "content_type": "text/plain"}])
+    result = call("send", {"to": "dave@example.test", "subject": "Hi", "body": "Text", "account": "alpha",
+                           "attachments_inline": inline, "confirmation_code": "4711"})
+    assert result.startswith("Error:") and "filename" in result and smtp.sent == []
+
+
+def test_inline_attachment_with_a_normal_filename_is_sent(env):
+    _, smtp = env
+    inline = json.dumps([{"filename": "Bericht Müller.txt", "content_base64": "aGk=", "content_type": "text/plain"}])
+    result = call_json("send", {"to": "dave@example.test", "subject": "Hi", "body": "Text", "account": "alpha",
+                                "attachments_inline": inline, "confirmation_code": "4711"})
+    assert result["status"] == "sent"

@@ -372,3 +372,13 @@ def test_subject_rejects_unicode_line_separators():
 
 def test_unknown_action_does_not_echo_the_caller_string():
     assert "SECRET-ACTION" not in call("SECRET-ACTION")
+
+
+@pytest.mark.parametrize("char", ["\x0b", "\x1f", "\x7f", "\x85", "\r", "\n", "\x00"])
+def test_folder_names_reject_control_characters(char):
+    problems = problems_of("list_emails", {"folder": "In%sbox" % char})
+    assert problems and problems[0]["problem"] == "invalid_value" and problems[0]["param"] == "folder"
+
+
+def test_folder_names_with_umlauts_are_accepted():
+    assert values_of("list_emails", {"folder": "INBOX/Flüge Ärger"})["folder"] == "INBOX/Flüge Ärger"

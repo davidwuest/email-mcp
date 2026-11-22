@@ -730,6 +730,11 @@ def _format_from_header(acct: Dict[str, Any]) -> str:
         return formataddr((display_name, sender))
     return sender
 
+def _inbound_id_header(value: Any) -> str:
+    """Message-ID style value from an inbound mail: unfold, and drop it if control characters remain."""
+    text = " ".join(str(value or "").split())
+    return "" if _HEADER_UNSAFE.search(text) else text
+
 def _compose_and_send(
     acct: Dict[str, Any], to: str, subject: str, body: str,
     body_html: Optional[str] = None, cc: Optional[str] = None, bcc: Optional[str] = None,
@@ -788,6 +793,8 @@ def _compose_and_send(
         try:
             for att in json.loads(inline_attachments):
                 filename = att.get("filename", "attachment")
+                if not isinstance(filename, str) or _HEADER_UNSAFE.search(filename):
+                    return {"error": "Inline attachment filename must be a single line of text without control characters."}
                 content_type = att.get("content_type", "application/octet-stream")
                 maintype, subtype = content_type.split("/", 1)
                 file_data = base64.b64decode(att["content_base64"])
@@ -1001,8 +1008,8 @@ def _coerce_strict_bool(value: Any, param: Param) -> bool:
 def _coerce_folder(value: Any, param: Param) -> str:
     if not isinstance(value, str):
         raise _wrong_type(param, value)
-    if not value or re.search(r"[\r\n\x00]", value):
-        raise _Invalid("invalid_value", hint="must be a non-empty folder name without line breaks")
+    if not value or _HEADER_UNSAFE.search(value):
+        raise _Invalid("invalid_value", hint="must be a non-empty folder name without line breaks or control characters")
     return value
 
 def _coerce_addresses(value: Any, param: Param) -> Addresses:
@@ -1296,7 +1303,7 @@ async def _do_send(p: Dict[str, Any]) -> str:
                 raw = msg_data[0][1] if status == "OK" and msg_data and isinstance(msg_data[0], tuple) else (msg_data[0] if status == "OK" and msg_data else None)
                 if not isinstance(raw, bytes):
                     return f"Error: reply_to_uid {p['reply_to_uid']} not found in folder '{opened['name']}'; nothing was sent."
-                orig_id = email.message_from_bytes(raw).get("Message-ID", "")
+                orig_id = _inbound_id_header(email.message_from_bytes(raw).get("Message-ID", ""))
                 if orig_id:
                     in_reply_to = orig_id
                     references = orig_id
@@ -1329,7 +1336,7 @@ async def _do_reply(p: Dict[str, Any]) -> str:
         orig_subject = _decode_header_value(orig.get("Subject"))
         orig_date = orig.get("Date", "")
         orig_body = _extract_body(orig)
-        orig_msg_id = orig.get("Message-ID", "")
+        orig_msg_id = _inbound_id_header(orig.get("Message-ID", ""))
         reply_addr = _reply_address(orig)
         if not reply_addr:
             return "Error: Original email has no valid Reply-To or From address."
@@ -1373,7 +1380,7 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
         orig_subject = _decode_header_value(orig.get("Subject"))
         orig_date = orig.get("Date", "")
         orig_body = _extract_body(orig)
-        orig_msg_id = orig.get("Message-ID", "")
+        orig_msg_id = _inbound_id_header(orig.get("Message-ID", ""))
         reply_addr = _reply_address(orig)
         if not reply_addr:
             return "Error: Original email has no valid Reply-To or From address."
